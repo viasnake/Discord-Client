@@ -1,0 +1,71 @@
+name: Perl CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Perl::Critic
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: '5'
+      - name: Install pinned lint dependencies
+        run: cpanm --notest Perl::Critic@1.156 Perl::Tidy@20260826
+      - name: Run Perl::Critic
+        run: perlcritic --profile .perlcriticrc lib t examples Makefile.PL
+
+  test:
+    name: Perl ${{ matrix.perl }} on ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        perl: ['5.26', '5.32', '5']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: ${{ matrix.perl }}
+          distribution: ${{ matrix.os == 'windows-latest' && 'strawberry' || 'default' }}
+      - name: Install runtime and test dependencies
+        run: cpanm --notest --installdeps .
+      - name: Run unit tests
+        id: tests
+        run: prove -lr t
+      - name: Diagnose local TLS failures
+        if: failure() && steps.tests.conclusion == 'failure'
+        run: |
+          perl -MIO::Socket::SSL -MNet::SSLeay -MTime::HiRes -e 'print "IO::Socket::SSL ", IO::Socket::SSL->VERSION, ", Net::SSLeay ", Net::SSLeay->VERSION, ", Time::HiRes ", Time::HiRes->VERSION, ", ", Net::SSLeay::SSLeay_version(0), "\n"'
+          perl -MIO::Socket::SSL=debug3 -Ilib t/08-rest-tls.t
+
+  distribution:
+    name: CPAN distribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: '5'
+      - name: Install runtime and test dependencies
+        run: cpanm --notest --installdeps .
+      - name: Test the packaged distribution
+        run: |
+          perl Makefile.PL
+          make disttest
