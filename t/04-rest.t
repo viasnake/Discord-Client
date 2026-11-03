@@ -11,6 +11,8 @@ T2->subtest(
     sub {
         my ( $rest, $http ) = client();
         T2->is( $http->count, 0, 'construction performs no HTTP I/O' );
+
+        # Send Unicode through the fake transport and inspect the actual request envelope.
         my $future = $rest->request( 'POST', '/channels/123/messages', json => { content => "hello \x{2603}" } );
 
         T2->isa_ok( $future, 'Future' );
@@ -34,6 +36,7 @@ T2->subtest(
         );
         T2->is( $transport->{max_redirects}, 0, 'credentials cannot follow a redirect' );
 
+        # Return a uint64-sized string ID and unknown fields without narrowing either.
         my $message = { id => '18446744073709551615', extra => [ 1, 2 ] };
         $http->respond( response( 200, $message ) );
         T2->is( scalar( $future->get ), $message, 'large snowflakes and unknown fields survive decoding' );
@@ -45,6 +48,8 @@ T2->subtest(
     'array-valued query parameters are repeated and array responses stay arrays',
     sub {
         my ( $rest, $http ) = client();
+
+        # Exercise repeated query values and preserve the response collection shape.
         my $future =
             $rest->request( 'GET', '/users/@me', query => { id => [ '123', '456' ], limit => 2 } );
 
@@ -60,10 +65,13 @@ T2->subtest(
     'HTTP 204 and HEAD do not require JSON bodies',
     sub {
         my ( $rest, $http ) = client();
+
+        # A successful deletion has no JSON document to decode.
         my $deletion = $rest->request( 'DELETE', '/channels/123/messages/456' );
         $http->respond( response( 204, undef ) );
         T2->is( scalar( $deletion->get ), undef, 'HTTP 204 resolves without JSON' );
 
+        # HEAD also omits the body even when the status is 200.
         my $head = $rest->request( 'HEAD', '/users/@me' );
         $http->respond( HTTP::Response->new(200) );
         T2->is( scalar( $head->get ), undef, 'HEAD resolves without JSON' );
@@ -76,10 +84,13 @@ T2->subtest(
     sub {
         my ( $rest, $http ) = client();
         my $future = $rest->request( 'GET', '/users/@me', raw_response => 1 );
+
+        # Attach a credential-bearing request to the response as a real transport might.
         my $original = response( 200, { id => '12' }, 'X-Example' => 'value' );
         $original->request( $http->call->{request} );
         $http->respond($original);
 
+        # Expose detached response metadata without retaining or mutating the source request.
         my $raw = $future->get;
         T2->isa_ok( $raw, 'HTTP::Response' );
         T2->is( $raw->header('X-Example'), 'value', 'server headers are available' );
@@ -90,6 +101,7 @@ T2->subtest(
     }
 );
 
+# Cover status classification and actionable Discord diagnostics with fresh clients.
 my @http_failures = (
     { name => 'permission denied', status => 403, category => 'permission' },
     { name => 'resource missing', status => 404, category => 'not_found' },
@@ -128,6 +140,8 @@ T2->subtest(
     'malformed successful JSON fails without exposing the response body',
     sub {
         my ( $rest, $http ) = client();
+
+        # Place a token in malformed content to check the parser failure cannot disclose it.
         my $future = $rest->request( 'GET', '/users/@me' );
         $http->respond( HTTP::Response->new( 200, undef, [], '{broken FAKE_TEST_TOKEN' ) );
 
@@ -142,6 +156,8 @@ T2->subtest(
     'non-JSON server errors retain the HTTP failure category',
     sub {
         my ( $rest, $http ) = client();
+
+        # A server error page must keep its HTTP category even though it is not JSON.
         my $future = $rest->request( 'GET', '/users/@me' );
         $http->respond( HTTP::Response->new( 503, undef, [], '<html>unavailable</html>' ) );
 
@@ -155,6 +171,8 @@ T2->subtest(
     'failure details redact Bot, webhook and nested authorization credentials',
     sub {
         my ( $rest, $http ) = client();
+
+        # Simulate credentials echoed in message text, named fields and nested structures.
         my $future = $rest->request( 'POST', '/webhooks/123/WEBHOOK_SECRET', json => {} );
         $http->respond(
             response(
@@ -182,6 +200,7 @@ T2->subtest(
     }
 );
 
+# Reject paths that could change the intended API destination before calling HTTP.
 my @invalid_paths = (
     { name => 'absolute URL', path => 'https://evil.test/a' },
     { name => 'scheme-relative URL', path => '//evil.test/a' },
@@ -207,6 +226,8 @@ T2->subtest(
     'unencodable bodies fail before sending HTTP',
     sub {
         my ( $rest, $http ) = client();
+
+        # Serialization failure is local and must not consume a request slot.
         my $future = $rest->request( 'GET', '/users/@me', json => sub { } );
 
         T2->is( error($future)->category, 'request', 'invalid JSON bodies produce a failed Future' );
