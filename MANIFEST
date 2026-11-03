@@ -71,3 +71,4 @@ t/26-friendly-api.t
 t/lib/TestDiscordExamples.pm
 t/lib/TestDiscordGateway.pm
 t/lib/TestDiscordREST.pm
+t/lib/TestDiscordTLS.pm

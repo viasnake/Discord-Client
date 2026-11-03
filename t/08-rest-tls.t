@@ -1,37 +1,21 @@
 use v5.26;
 use warnings;
 use Test2::V1;
-use File::Temp qw(tempdir);
+use lib 't/lib';
+use TestDiscordTLS qw(certificate_directory);
 use IO::Async::Loop;
 use IO::Async::Listener;
 use IO::Async::SSL;
-use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file CERT_free KEY_free);
 use Net::Async::HTTP;
 use Discord::Client::REST;
 
 sub tls_server {
     my ($certificate_ip) = @_;
-    my $directory = tempdir( CLEANUP => 1 );
 
-    # Trust a test CA only in the cases that explicitly supply it to the client.
-    my ( $ca_certificate, $ca_key ) = CERT_create(
-        subject => { commonName => 'REST test CA' },
-        purpose => 'sslCA',
-    );
-    my ( $certificate, $key ) = CERT_create(
-        issuer => [ $ca_certificate, $ca_key ],
-        purpose => 'server',
-        subject => { commonName => $certificate_ip },
-        subjectAltNames => [ [ 'IP', $certificate_ip ] ],
-        not_before => time() - 60,
-        not_after => time() + 3600,
-    );
-    PEM_cert2file( $ca_certificate, "$directory/ca.pem" );
-    PEM_cert2file( $certificate, "$directory/cert.pem" );
-    PEM_key2file( $key, "$directory/key.pem" );
-    CERT_free($_) for $certificate, $ca_certificate;
-    KEY_free($_) for $key, $ca_key;
+    # Trust this private CA only when the test explicitly supplies it to the client.
+    my $directory = certificate_directory($certificate_ip);
 
+    # Record only HTTP requests that made it through the local TLS handshake.
     my $loop = IO::Async::Loop->new;
     my ( @streams, @requests, @handshake_errors );
     my $listener = IO::Async::Listener->new(
@@ -75,6 +59,8 @@ sub tls_server {
 
 sub close_server {
     my ($fixture) = @_;
+
+    # Close accepted connections before stopping the listener and releasing its loop resources.
     for my $stream ( @{ $fixture->{streams} } ) {
         $stream->close;
         $fixture->{loop}->remove($stream) if $stream->loop;
@@ -101,6 +87,7 @@ T2->subtest(
             base_url => $fixture->{base_url},
         );
 
+        # A trusted matching certificate must allow credentials to reach the test server.
         my $request = $rest->get_current_user;
         $fixture->{loop}->await($request);
         T2->is( scalar( $request->get ), { tls => 1 }, 'HTTPS response is decoded' );
@@ -111,6 +98,7 @@ T2->subtest(
             'authorization is sent only after TLS succeeds'
         );
 
+        # Close SDK work first, then release the injected transport and server.
         $rest->close->get;
         T2->ref_is( $http->loop, $fixture->{loop}, 'injected TLS transport remains caller-owned' );
         $fixture->{loop}->remove($http);
@@ -143,6 +131,7 @@ T2->subtest(
 T2->subtest(
     'a trusted CA cannot authorize the wrong server hostname',
     sub {
+        # Trust the issuer but give the server a different IP in its certificate.
         my $fixture = tls_server('127.0.0.2');
         my $http = Net::Async::HTTP->new(
             fail_on_error => 0,
@@ -159,6 +148,7 @@ T2->subtest(
             base_url => $fixture->{base_url},
         );
 
+        # Hostname validation must reject the connection before any HTTP headers are sent.
         my $request = $rest->get_current_user;
         $fixture->{loop}->await($request);
         T2->ok( $request->is_failed, 'hostname mismatch fails the request' );

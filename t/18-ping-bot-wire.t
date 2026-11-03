@@ -1,41 +1,22 @@
 use v5.26;
 use warnings;
 use Test2::V1;
-use File::Temp qw(tempdir);
 use Future;
 use IO::Async::Loop;
 use IO::Async::Listener;
 use IO::Async::SSL;
-use IO::Socket::SSL::Utils qw(CERT_create PEM_cert2file PEM_key2file CERT_free KEY_free);
 use JSON::PP;
 use Net::Async::WebSocket::Server;
 use Discord::Client::REST;
 use lib 't/lib';
+use TestDiscordTLS qw(certificate_directory);
 use TestDiscordExamples qw(load_example);
 
-my $dir = tempdir( CLEANUP => 1 );
-my ( $ca_cert, $ca_key ) = CERT_create(
-    subject => { commonName => 'Ping bot test CA' },
-    purpose => 'sslCA',
-);
-my ( $cert, $key ) = CERT_create(
-    issuer => [ $ca_cert, $ca_key ],
-    purpose => 'server',
-    subject => { commonName => '127.0.0.1' },
-    subjectAltNames => [ [ 'IP', '127.0.0.1' ] ],
-    not_before => time() - 60,
-    not_after => time() + 3600
-);
-PEM_cert2file( $ca_cert, "$dir/ca.pem" );
-PEM_cert2file( $cert, "$dir/cert.pem" );
-PEM_key2file( $key, "$dir/key.pem" );
-CERT_free($cert);
-KEY_free($key);
-CERT_free($ca_cert);
-KEY_free($ca_key);
+# Create a short-lived CA and loopback certificate trusted only by this test client.
+my $dir = certificate_directory('127.0.0.1');
 my $loop = IO::Async::Loop->new;
 my ( @clients, @streams, @requests, @errors );
-my ( $gateway_url, $ws );
+my ( $gateway_url, $gateway_socket );
 my $interaction = sub {
     my ( $id, $type, $data ) = @_;
     return {
@@ -51,11 +32,13 @@ my $interaction = sub {
         }
     };
 };
+
+# The local Gateway sends a command after Identify and acknowledges heartbeats.
 my $server = Net::Async::WebSocket::Server->new(
     on_client => sub {
         my ( undef, $client ) = @_;
         push @clients, $client;
-        $ws = $client;
+        $gateway_socket = $client;
         $client->configure(
             on_text_frame => sub {
                 my $packet = JSON::PP->new->decode( $_[1] );
@@ -96,6 +79,7 @@ $server->listen(
 )->get;
 $gateway_url = 'wss://127.0.0.1:' . $server->read_handle->sockport . '/';
 
+# Serve discovery and callback requests over real local HTTP connections.
 my $http_server = IO::Async::Listener->new(
     on_stream => sub {
         my ( undef, $stream ) = @_;
@@ -103,6 +87,8 @@ my $http_server = IO::Async::Listener->new(
         $stream->configure(
             on_read => sub {
                 my ( $stream, $buffer ) = @_;
+
+                # Wait for the complete headers and body before consuming a request.
                 my $end = index( $$buffer, "\r\n\r\n" );
                 return 0 if $end < 0;
                 $end += 4;
@@ -141,7 +127,7 @@ my $http_server = IO::Async::Listener->new(
                         T2->is( $body->{data}{content}, 'Press the button.', 'example slash reply' );
                         T2->is( $body->{data}{components}[0]{components}[0]{custom_id},
                             'hello', 'example button payload' );
-                        $ws->send_text_frame(
+                        $gateway_socket->send_text_frame(
                             JSON::PP->new->encode(
                                 $interaction->( 101, 3, { custom_id => 'hello', component_type => 2 } )
                             )
@@ -173,6 +159,8 @@ my $rest = Discord::Client::REST->new(
             if $_[0]{type} eq 'http_response' && $_[0]{status} == 204 && ++$acks == 2;
     }
 );
+
+# Run the documented example against both local transports with a bounded wait.
 my $bot = load_example(
     'examples/components.pl',
     token => 'FAKE_WIRE_TOKEN',
@@ -188,6 +176,8 @@ T2->ok( $started->is_done && $done->is_done,
 T2->is( $bot->interactions->stats->{handled}, 2, 'both handlers and acknowledgements complete' );
 T2->is( scalar(@requests), 3, 'only discovery and two callbacks; no startup sync' );
 T2->is( scalar(@errors), 0, 'no integration errors' );
+
+# Release client-owned resources before closing the local server connections.
 $bot->close->get;
 $rest->close->get;
 $_->close for @clients, @streams;
