@@ -7,6 +7,7 @@ use Carp qw(croak);
 
 our $VERSION = '0.001';
 
+# Keep Discord bit positions explicit, including gaps reserved by the protocol.
 my %BITS = (
     GUILDS => 1 << 0,
     GUILD_MEMBERS => 1 << 1,
@@ -33,6 +34,8 @@ my %BITS = (
 
 sub bits {
     my ( $class, @names ) = @_;
+
+    # Validate names before combining their bits; repeated names remain idempotent.
     my $value = 0;
     for my $name (@names) {
         croak 'intent name must be a string' if !defined($name) || ref($name);

@@ -12,6 +12,8 @@ our @EXPORT_OK = qw(row button text_input modal);
 
 sub _text {
     my ( $value, $maximum, $name ) = @_;
+
+    # Validate character length before coercing a Perl scalar into a JSON string.
     croak "$name must be a string of 1 to $maximum characters"
         unless defined($value)
         && !ref($value)
@@ -29,6 +31,8 @@ sub button {
     croak 'Unknown button style' unless !ref($style) && exists $styles{$style};
     croak 'Use native JSON for link or premium buttons'
         if exists( $options{url} ) || exists( $options{sku_id} );
+
+    # Normalize optional wire fields before constructing the component payload.
     $options{label} = _text( $options{label}, 80, 'Button label' );
     $options{disabled} = $options{disabled} ? JSON::PP::true : JSON::PP::false
         if exists $options{disabled};
@@ -64,6 +68,8 @@ sub text_input {
     my %styles = ( short => 1, paragraph => 2 );
     my $style = delete( $options{style} ) // 'short';
     croak 'Unknown text input style' unless !ref($style) && exists $styles{$style};
+
+    # Normalize optional bounds before assembling the nested Label and Text Input.
     for my $name (qw(min_length max_length)) {
         next unless exists $options{$name};
         my $minimum = $name eq 'min_length' ? 0 : 1;
@@ -80,6 +86,8 @@ sub text_input {
         if ( $options{min_length} // 0 ) > ( $options{max_length} // 4000 );
     $options{required} = $options{required} ? JSON::PP::true : JSON::PP::false
         if exists $options{required};
+
+    # Keep Label metadata separate from the nested input properties.
     my $field = {
         type => 18,
         label => $label,
@@ -101,6 +109,8 @@ sub modal {
     # Build the native payload expected by Interaction->modal without sending it.
     croak 'A modal requires one to five fields'
         unless ref($fields) eq 'ARRAY' && @$fields >= 1 && @$fields <= 5;
+
+    # Reject duplicate input IDs so field lookup identifies exactly one submitted value.
     my %ids;
     for my $field (@$fields) {
         croak 'A modal field must be a Label'
@@ -108,7 +118,8 @@ sub modal {
             && ( $field->{type} // 0 ) == 18
             && ref( $field->{component} ) eq 'HASH';
         my $id = _text( $field->{component}{custom_id}, 100, 'Input ID' );
-        croak 'Duplicate modal field ID' if $ids{$id}++;
+        croak 'Duplicate modal field ID' if $ids{$id};
+        $ids{$id} = 1;
     }
     return {
         %options,

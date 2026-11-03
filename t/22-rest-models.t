@@ -6,6 +6,7 @@ use lib 't/lib';
 use TestDiscordREST qw(client response error);
 use Discord::Client::Model;
 
+# Each public helper must preserve its endpoint, request shape and unknown response fields.
 my @endpoints = (
     {
         name => 'current user discovery',
@@ -141,6 +142,7 @@ for my $case (@endpoints) {
     );
 }
 
+# Invalid identifiers and incompatible query parameters must fail before transport I/O.
 my @invalid_requests = (
     {
         name => 'conflicting pagination cursors',
@@ -174,6 +176,8 @@ for my $case (@invalid_requests) {
 T2->subtest(
     'model snapshots preserve large IDs and isolate nested data',
     sub {
+
+        # Mutate both the source data and returned copies to check snapshot isolation.
         my $data = { id => '9007199254740993', name => 'general', extra => { future_field => 1 } };
         my $channel = Discord::Client::Model->wrap( channel => $data );
         $data->{extra}{future_field} = 2;
@@ -253,6 +257,8 @@ T2->subtest(
 
         T2->is( $edit->get->content, 'changed', 'edit returns the updated snapshot' );
         T2->is( $message->content, 'original', 'the original snapshot is unchanged' );
+
+        # Deletion succeeds with an empty HTTP 204 response rather than requiring JSON.
         my $deletion = $message->delete;
         $http->respond( response( 204, undef ) );
         T2->is( scalar( $deletion->get ), undef, 'successful deletion has no JSON body' );
@@ -304,6 +310,8 @@ T2->subtest(
         my ( $rest, $http ) = client();
         my $channel = Discord::Client::Model->wrap( channel => { id => '2' }, rest => $rest );
         my $future = $channel->send('hello');
+
+        # Cancelling the model operation must release its underlying HTTP request.
         $future->cancel;
 
         T2->ok( $http->call->{future}->is_cancelled, 'the pending HTTP request is cancelled' );

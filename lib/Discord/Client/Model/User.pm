@@ -11,12 +11,16 @@ sub mention { '<@' . $_[0]->id . '>' }
 
 sub create_dm {
     my ($self) = @_;
+
+    # Open the DM explicitly and share REST with the returned channel snapshot.
     my $request = $self->_call( create_dm => $self->id );
     return $self->_model_future( channel => $request );
 }
 
 sub refresh {
     my ($self) = @_;
+
+    # Fetch a replacement user snapshot without mutating this one.
     my $request = $self->_call( get_user => $self->id );
     return $self->_model_future( user => $request );
 }

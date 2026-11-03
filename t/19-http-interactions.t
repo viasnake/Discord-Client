@@ -13,6 +13,8 @@ use Discord::Client::HTTPInteractions;
 
 sub fixture {
     my (%options) = @_;
+
+    # Use a fresh signing key and controlled clocks for each independent HTTP scenario.
     my $signer = Crypt::PK::Ed25519->new->generate_key;
     my $clock = bless { now => 0, timers => [] }, 'TestDiscordREST::Clock';
     my @errors;
@@ -33,6 +35,8 @@ sub signed {
     my $clock = $fixture->{clock};
     my $signer = $fixture->{signer};
     $timestamp //= 1700000000 + int( $clock->{now} );
+
+    # Sign the exact UTF-8 bytes that the endpoint receives, including the timestamp prefix.
     my $body = ref($payload) ? JSON::PP->new->utf8->encode($payload) : $payload;
     return (
         {
@@ -57,6 +61,8 @@ sub json { JSON::PP->new->utf8->decode( $_[0][2][0] ) }
 
 sub env {
     my ( $headers, $body, $streaming ) = @_;
+
+    # The returned PSGI environment owns this stream until the application reads its body.
     open my $input, '<', \$body or die 'scalar input';
     binmode $input;
     return {
@@ -85,6 +91,8 @@ T2->subtest(
             401, 'malformed signature rejected' );
         ( $headers, $body ) = signed( $fixture, { type => 1 }, 1699999600 );
         T2->is( $http->handle( $headers, $body )->get->[0], 401, 'old signed request rejected by age policy' );
+
+        # Only authenticated bytes reach JSON parsing, and parser errors must not echo them.
         ( $headers, $body ) = signed( $fixture, '{bad FAKE_HTTP_TOKEN' );
         my $bad = $http->handle( $headers, $body )->get;
         T2->is( $bad->[0], 400, 'valid signature with malformed JSON returns 400' );
@@ -102,13 +110,18 @@ T2->subtest(
         my $calls = 0;
         $http->command(
             ping => description => 'Ping',
-            handler => sub { ++$calls; $_[0]->reply("Pong \x{2603}!") }
+            handler => sub {
+                ++$calls;
+                $_[0]->reply("Pong \x{2603}!");
+            }
         );
         my ( $headers, $body ) = signed( $fixture, payload( 100, 'ping' ) );
         my $response = $http->handle( $headers, $body )->get;
         T2->is( $response->[0], 200, 'HTTP inline response' );
         T2->is( json($response)->{data}{content}, "Pong \x{2603}!", 'UTF-8 response' );
         T2->is( $calls, 1, 'handler invoked once' );
+
+        # A duplicate receives an independent response snapshot without repeating side effects.
         $response->[2][0] = 'changed';
         my $again = $http->handle( $headers, $body )->get;
         T2->is( json($again)->{type}, 4, 'cached response copied for retry' );
@@ -129,11 +142,13 @@ T2->subtest(
         my $response = $app->( env( $headers, $body, 0 ) );
         T2->ref_ok( $response, 'ARRAY', 'immediate response works on ordinary PSGI' );
         T2->is( json($response)->{type}, 1, 'PSGI PONG' );
+
+        # A delayed reply advances only when the host drives the event loop.
         $http->command(
             slow => description => 'Slow',
             handler => sub {
-                my ($ctx) = @_;
-                return $clock->delay(1)->then( sub { $ctx->reply('later') } );
+                my ($interaction) = @_;
+                return $clock->delay(1)->then( sub { $interaction->reply('later') } );
             }
         );
         ( $headers, $body ) = signed( $fixture, payload( 101, 'slow' ) );
@@ -144,9 +159,13 @@ T2->subtest(
         T2->ok( !defined($result), 'application never starts the loop implicitly' );
         $clock->advance(1);
         T2->is( json($result)->{data}{content}, 'later', 'host-driven loop completes delayed response' );
+
+        # Hosts without delayed-response support must reject and cancel asynchronous work.
         ( $headers, $body ) = signed( $fixture, payload( 102, 'slow' ) );
         T2->is( $app->( env( $headers, $body, 0 ) )->[0], 503, 'async work requires streaming PSGI support' );
         T2->is( $clock->timer_count, 0, 'unsupported async request cancels its timers' );
+
+        # Reject unsupported methods and truncated bodies before dispatch.
         my $get = env( $headers, $body, 0 );
         $get->{REQUEST_METHOD} = 'GET';
         T2->is( $app->($get)->[0], 405, 'only POST accepted' );
@@ -166,9 +185,13 @@ T2->subtest(
         $http->command( unanswered => description => 'Unanswered', handler => sub { } );
         my ( $headers, $body ) = signed( $fixture, payload( 103, 'unanswered' ) );
         my $response_future = $http->handle( $headers, $body );
+
+        # Unanswered requests must settle at the initial-response deadline.
         $clock->advance(3);
         T2->is( $response_future->get->[0], 504, 'unanswered interaction has bounded deadline' );
         T2->unlike( join( ' ', @$errors ), qr/FAKE_HTTP_TOKEN/, 'handler/deadline diagnostics sanitized' );
+
+        # Shutdown also settles pending responses and releases their deadline timers.
         ( $headers, $body ) = signed( $fixture, payload( 104, 'unanswered' ) );
         my $pending = $http->handle( $headers, $body );
         $http->close->get;

@@ -12,6 +12,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Require a resource identity before constructing a detached JSON snapshot.
     croak 'Model data requires an ID'
         unless ref( $args{data} ) eq 'HASH'
         && defined( $args{data}{id} )
@@ -25,6 +27,8 @@ sub new {
 
 sub _clone {
     my ($data) = @_;
+
+    # Support scalar field values as well as nested resource data.
     my $json = JSON::PP->new->allow_nonref;
     return $json->decode( $json->encode($data) );
 }
@@ -35,6 +39,8 @@ sub rest { $_[0]->{rest} }
 
 sub wrap {
     my ( $class, $type, $data, %args ) = @_;
+
+    # Load only known model classes; caller input never becomes an arbitrary module path.
     my %classes = ( message => 'Message', channel => 'Channel', guild => 'Guild', user => 'User' );
     croak 'Unknown model type' unless defined($type) && !ref($type) && $classes{$type};
     my $package = 'Discord::Client::Model::' . $classes{$type};
@@ -45,14 +51,16 @@ sub wrap {
 
 sub _call {
     my ( $self, $method, @args ) = @_;
-    unless ( $self->{rest} ) {
-        return $self->_failed( 'Model operation requires a REST client', 'state' );
-    }
+
+    # Read-only snapshots fail asynchronous operations without constructing a hidden client.
+    return $self->_failed( 'Model operation requires a REST client', 'state' ) unless $self->{rest};
     return $self->{rest}->$method(@args);
 }
 
 sub _model_future {
     my ( $self, $type, $future ) = @_;
+
+    # Wrap successful responses without mutating the original resource snapshot.
     return $future->then(
         sub {
             my ($data) = @_;

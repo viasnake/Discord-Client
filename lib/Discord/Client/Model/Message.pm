@@ -11,12 +11,16 @@ sub content { $_[0]->get('content') }
 
 sub is_from_bot {
     my ($self) = @_;
+
+    # Missing author metadata does not imply a bot; callers decide whether to ignore it.
     my $author = $self->get('author');
     return ref($author) eq 'HASH' && $author->{bot} ? 1 : 0;
 }
 
 sub author {
     my ($self) = @_;
+
+    # Wrap the embedded user without another request or a cache dependency.
     my $author = $self->get('author');
     return undef unless ref($author) eq 'HASH';
     return Discord::Client::Model->wrap( user => $author, rest => $self->rest );
@@ -35,6 +39,8 @@ sub channel {
 
 sub edit {
     my ( $self, $body ) = @_;
+
+    # Edits return a new snapshot; this message remains the originally observed version.
     my $request = $self->_call( edit_message => $self->channel_id, $self->id, $body );
     return $self->_model_future( message => $request );
 }
@@ -46,6 +52,8 @@ sub delete {
 
 sub reply {
     my ( $self, $body ) = @_;
+
+    # Copy caller data before adding the source message reference.
     $body = { content => "$body" } if defined($body) && !ref($body);
     if ( ref($body) eq 'HASH' ) {
         $body = { %$body, message_reference => { message_id => $self->id, channel_id => $self->channel_id }, };

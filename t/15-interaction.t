@@ -10,6 +10,8 @@ use Discord::Client::Interaction;
 sub context {
     my (%args) = @_;
     my ( $rest, $http, $clock ) = client();
+
+    # Provide a valid command envelope while allowing each scenario to replace selected fields.
     my $payload = {
         id => '123',
         application_id => '456',
@@ -36,6 +38,8 @@ T2->subtest(
     sub {
         my ( $interaction, $rest, $http, $clock ) = context();
         T2->is( $http->count, 0, 'context construction performs no HTTP' );
+
+        # Reserve the single initial response before the transport confirms delivery.
         my $response_future = $interaction->reply( 'Pong!', ephemeral => 1 );
         T2->is( $interaction->state, 'responding', 'initial reply reserved before response' );
         T2->is( error( $interaction->reply('duplicate') )->category, 'state', 'concurrent duplicate rejected' );
@@ -55,6 +59,8 @@ T2->subtest(
         T2->ok( $response_future->is_done && $interaction->acknowledgement->is_done, 'confirmed acknowledgement' );
         T2->is( $interaction->state, 'replied', 'replied state' );
         T2->is( $clock->timer_count, 0, 'initial timer cancelled' );
+
+        # Confirmed acknowledgement enables webhook followups and original-message edits.
         my $followup = $interaction->followup( 'More', ephemeral => 1 );
         T2->is(
             $http->call->{request}->uri->path,
@@ -68,6 +74,8 @@ T2->subtest(
         T2->is( $http->call->{request}->method, 'PATCH', 'edit method' );
         $http->respond( response( 200, { content => 'edited' } ) );
         T2->ok( $edit->is_done, 'original edit' );
+
+        # A closed context must reject further token-based operations.
         $interaction->close;
         T2->is( error( $interaction->followup('closed') )->category, 'shutdown', 'closed context rejects I/O' );
         $rest->close;
@@ -78,6 +86,8 @@ T2->subtest(
     'defer then reply edits the original exactly once',
     sub {
         my ( $interaction, $rest, $http ) = context();
+
+        # Fix ephemeral visibility in the initial deferral before completing its message.
         my $defer = $interaction->defer( ephemeral => 1 );
         T2->is(
             JSON::PP->new->utf8->decode( $http->call->{request}->content ),
@@ -88,6 +98,8 @@ T2->subtest(
         T2->is( $interaction->state, 'deferred', 'deferred state' );
         T2->is( error( $interaction->reply( 'result', ephemeral => 0 ) )->category,
             'request', 'deferred visibility cannot change' );
+
+        # Completion edits the original exactly once, including while its PATCH is pending.
         my $result = $interaction->reply('result');
         T2->is( $http->call->{request}->method, 'PATCH', 'deferred reply is an edit' );
         T2->is( error( $interaction->reply('duplicate') )->category, 'state', 'concurrent final reply prevented' );
@@ -102,7 +114,10 @@ T2->subtest(
 T2->subtest(
     'deadline includes queue/transport waiting and late dispatch',
     sub {
+        # A payload received too long ago must fail before sending any request.
         my ( $interaction, $rest, $http, $clock ) = context();
+
+        # Let transport waiting consume the initial three-second deadline.
         my $response_future = $interaction->reply('slow');
         my $io = $http->call->{future};
         $clock->advance(3);
@@ -128,6 +143,8 @@ T2->subtest(
         my ( $interaction, $rest, $http, $clock ) = context();
         $interaction->defer;
         $http->respond( response( 204, undef ) );
+
+        # Check the last usable instant and then cross the token expiry boundary.
         $clock->advance(899.9);
         my $response_future = $interaction->followup('last');
         $http->respond( response( 200, {} ) );
@@ -143,6 +160,7 @@ T2->subtest(
 T2->subtest(
     'options, resolved entities, components and autocomplete',
     sub {
+        # Select a nested command and resolve a large string ID without additional I/O.
         my ( $interaction, $rest, $http ) = context(
             payload => {
                 data => {
@@ -177,6 +195,8 @@ T2->subtest(
                 data => { custom_id => 'select', component_type => 3, values => [ 'a', 'b' ] }
             }
         );
+
+        # Component selections use their native values and may defer a message update.
         T2->is( $interaction->values, [ 'a', 'b' ], 'select values' );
         $interaction->defer( update => 1 );
         T2->is( JSON::PP->new->utf8->decode( $http->call->{request}->content )->{type},
@@ -194,6 +214,8 @@ T2->subtest(
                 }
             }
         );
+
+        # Autocomplete uses choices rather than a normal message response.
         T2->is( $interaction->focused->{value}, 'p', 'focused value' );
         T2->is( error( $interaction->reply('invalid') )->category,
             'state', 'autocomplete cannot send normal reply' );
@@ -210,6 +232,8 @@ T2->subtest(
     'a failed initial response is not replayed',
     sub {
         my ( $interaction, $rest, $http ) = context();
+
+        # An ambiguous timeout must remain non-retryable and omit private transport details.
         my $response_future = $interaction->reply('first');
         $http->call->{future}->fail( 'FAKE_INTERACTION_TOKEN failed', 'timeout' );
         T2->is( error($response_future)->category, 'timeout', 'transport error categorized' );

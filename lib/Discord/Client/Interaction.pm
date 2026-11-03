@@ -16,6 +16,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Validate injected hooks and receipt time before creating timers.
     for my $key (qw(clock delay initial_sender)) {
         croak "$key must be a code reference" if exists( $args{$key} ) && ref( $args{$key} ) ne 'CODE';
     }
@@ -25,6 +27,8 @@ sub new {
             || ref( $args{received_at} )
             || !looks_like_number( $args{received_at} )
             || $args{received_at} =~ /(?:inf|nan)/i );
+
+    # Require the routing and token fields shared by supported interaction types.
     my $payload = $args{payload};
     croak 'Invalid interaction payload'
         unless ref($payload) eq 'HASH'
@@ -37,6 +41,8 @@ sub new {
         && !ref( $payload->{type} )
         && $payload->{type} =~ /\A[2-5]\z/
         && ref( $payload->{data} ) eq 'HASH';
+
+    # Derive both response deadlines from receipt time, including time spent in queues.
     my $loop = $args{loop} // IO::Async::Loop->new;
     my $clock = $args{clock} // sub { clock_gettime(CLOCK_MONOTONIC) };
     my $received = $args{received_at} // $clock->();
@@ -59,15 +65,21 @@ sub new {
         path => [],
         acknowledgement => $loop->new_future,
     }, $class;
+
+    # Parse command values before arming a deadline that could invoke callbacks.
     $self->_parse_options( $payload->{data}{options} // [], 0 );
     croak 'Autocomplete requires a focused value'
         if $self->{type} == 4
         && ( !$self->{focused} || $self->{focused}{type} !~ /\A(?:3|4|10)\z/ );
+
+    # A pending acknowledgement owns the deadline, without making the timer own the context.
     my $weak = $self;
     weaken($weak);
     $self->{acknowledgement}->on_cancel( sub { $weak->close if $weak } );
     my $after = $self->{deadline} - $clock->();
-    if ( $after <= 0 ) { $self->_expire_initial }
+    if ( $after <= 0 ) {
+        $self->_expire_initial;
+    }
     else {
         $self->{initial_timer} = $self->{delay}->($after);
         $self->{initial_timer}->on_done( sub { $weak->_expire_initial if $weak } );
@@ -76,6 +88,8 @@ sub new {
 }
 
 sub _id { defined( $_[0] ) && !ref( $_[0] ) && $_[0] =~ /\A\d+\z/ }
+
+# Payload accessors preserve unknown fields and do not fetch related resources.
 sub id { $_[0]->{id} }
 sub application_id { $_[0]->{application_id} }
 sub type { $_[0]->{type} }
@@ -129,6 +143,8 @@ sub member { $_[0]->{raw}{member} }
 
 sub resolved {
     my ( $self, $kind, $id ) = @_;
+
+    # Support the full resolved payload, one resource collection, or one resource ID.
     my $resolved = $self->{raw}{data}{resolved} // {};
     return $resolved unless $kind;
     return $resolved->{$kind} unless defined $id;
@@ -137,6 +153,8 @@ sub resolved {
 
 sub _parse_options {
     my ( $self, $options, $depth ) = @_;
+
+    # Bound each level and reject duplicate names before flattening selected values.
     croak 'Invalid interaction options' unless ref($options) eq 'ARRAY' && @$options <= 25 && $depth <= 2;
     my %names;
     for my $option (@$options) {
@@ -145,25 +163,29 @@ sub _parse_options {
             && defined( $option->{name} )
             && !ref( $option->{name} )
             && length( $option->{name} )
-            && !$names{ $option->{name} }++
             && defined( $option->{type} )
             && !ref( $option->{type} )
             && $option->{type} =~ /\A(?:[1-9]|10|11)\z/;
+        croak 'Invalid interaction option' if $names{ $option->{name} };
+        $names{ $option->{name} } = 1;
+
+        # Nested selectors form the command path; leaf options hold values and focus state.
         if ( $option->{type} == 1 || $option->{type} == 2 ) {
             croak 'Invalid nested interaction option' if exists $option->{value};
             push @{ $self->{path} }, $option->{name};
             $self->_parse_options( $option->{options} // [], $depth + 1 );
+            next;
         }
-        else {
-            croak 'Invalid interaction option value'
-                if exists( $option->{options} )
-                || !exists( $option->{value} )
-                || ( ref( $option->{value} ) && !JSON::PP::is_bool( $option->{value} ) );
-            $self->{options}{ $option->{name} } = $option->{value};
-            if ( $option->{focused} ) {
-                croak 'Multiple focused interaction options' if $self->{focused};
-                $self->{focused} = {%$option};
-            }
+
+        # Leaf values are flattened for handlers; only one may drive autocomplete.
+        croak 'Invalid interaction option value'
+            if exists( $option->{options} )
+            || !exists( $option->{value} )
+            || ( ref( $option->{value} ) && !JSON::PP::is_bool( $option->{value} ) );
+        $self->{options}{ $option->{name} } = $option->{value};
+        if ( $option->{focused} ) {
+            croak 'Multiple focused interaction options' if $self->{focused};
+            $self->{focused} = {%$option};
         }
     }
 }
@@ -178,17 +200,25 @@ sub _failed {
 sub _expire_initial {
     my ($self) = @_;
     return if $self->{acknowledgement}->is_ready;
+
+    # Mark expiry before notifying observers so no callback can start another response.
     $self->{state} = 'expired';
     my $failed = $self->_failed( 'Interaction initial response deadline exceeded', 'deadline' );
     $self->{acknowledgement}->fail( $failed->failure );
     if ( my $initial = $self->{initial_operation} ) {
         $initial->fail( $failed->failure ) unless $initial->is_ready;
     }
-    if ( my $source = delete $self->{initial_source} ) { $source->cancel unless $source->is_ready }
+
+    # Cancel outstanding delivery after publishing the deadline failure.
+    if ( my $source = delete $self->{initial_source} ) {
+        $source->cancel unless $source->is_ready;
+    }
 }
 
 sub _message {
     my ( $self, $message, %options ) = @_;
+
+    # Copy caller data before adding SDK-controlled visibility flags.
     croak 'Message must be a string or hash reference'
         unless defined($message)
         && ( !ref($message) || ref($message) eq 'HASH' );
@@ -207,6 +237,8 @@ sub reply {
     return $self->_failed( 'Autocomplete interactions require choices', 'state' ) if $self->{type} == 4;
     my $data = eval { $self->_message( $message, %options ) };
     return $self->_failed( 'Invalid interaction message', 'request' ) if $@;
+
+    # Complete a confirmed deferral by editing its original message exactly once.
     if ( $self->{state} eq 'deferred' || $self->{state} eq 'deferred_update' ) {
         return $self->_failed( 'Deferred response visibility is already fixed', 'request' )
             if exists $options{ephemeral};
@@ -221,6 +253,8 @@ sub reply {
 sub defer {
     my ( $self, %options ) = @_;
     return $self->_failed( 'Autocomplete cannot be deferred', 'state' ) if $self->{type} == 4;
+
+    # Message updates and new deferred replies have different visibility rules.
     if ( $options{update} ) {
         return $self->_failed( 'Update deferral requires a message component', 'state' ) unless $self->_can_update;
         return $self->_failed( 'Update deferral cannot set ephemeral visibility', 'request' ) if $options{ephemeral};
@@ -244,6 +278,8 @@ sub autocomplete {
     return $self->_failed( 'Choices require an autocomplete interaction', 'state' ) unless $self->{type} == 4;
     return $self->_failed( 'Invalid autocomplete choices', 'request' )
         unless ref($choices) eq 'ARRAY' && @$choices <= 25;
+
+    # Validate each suggestion against the focused option and normalize JSON value types.
     my @wire;
     for my $choice (@$choices) {
         return $self->_failed( 'Invalid autocomplete choice', 'request' )
@@ -255,13 +291,17 @@ sub autocomplete {
             && defined( $choice->{value} )
             && !ref( $choice->{value} );
         my $type = $self->{focused}{type};
-        return $self->_failed( 'Invalid autocomplete choice value', 'request' )
-            if $type == 3
-            ? length( $choice->{value} ) > 100
-            : !looks_like_number( $choice->{value} )
-            || abs( $choice->{value} ) > 9007199254740992
-            || ( $type == 4
-                && ( $choice->{value} != int( $choice->{value} ) || abs( $choice->{value} ) >= 9007199254740992 ) );
+        if ( $type == 3 ) {
+            return $self->_failed( 'Invalid autocomplete choice value', 'request' )
+                if length( $choice->{value} ) > 100;
+        }
+        else {
+            return $self->_failed( 'Invalid autocomplete choice value', 'request' )
+                if !looks_like_number( $choice->{value} )
+                || abs( $choice->{value} ) > 9007199254740992
+                || ( $type == 4
+                    && ( $choice->{value} != int( $choice->{value} ) || abs( $choice->{value} ) >= 9007199254740992 ) );
+        }
         push @wire, { %$choice, value => $type == 3 ? "$choice->{value}" : 0 + $choice->{value} };
     }
     return $self->_initial( 8, { choices => \@wire }, 'replied' );
@@ -269,6 +309,8 @@ sub autocomplete {
 
 sub modal {
     my ( $self, $data ) = @_;
+
+    # A modal opens only from a command or message component, never a modal submission.
     return $self->_failed( 'Modal response is invalid for this interaction', 'state' )
         unless $self->{type} == 2 || $self->{type} == 3;
     return $self->_failed( 'Invalid modal response', 'request' )
@@ -287,14 +329,23 @@ sub modal {
 
 sub _initial {
     my ( $self, $type, $data, $next_state ) = @_;
+
+    # Reject closed, expired or already-answered contexts before attempting delivery.
     return $self->_failed( 'Interaction is closed', 'shutdown' ) if $self->{closed};
     return $self->_failed( 'Interaction initial response deadline exceeded', 'deadline' )
         if $self->{clock}->() >= $self->{deadline} || $self->{state} eq 'expired';
     return $self->_failed( 'Interaction already has an initial response', 'state' ) unless $self->{state} eq 'new';
+
+    # Validate serialization before consuming the one initial-response opportunity.
     my $payload = { type => $type };
     $payload->{data} = $data if defined $data;
     return $self->_failed( 'Interaction response is not JSON encodable', 'request' )
-        unless eval { JSON::PP->new->encode($payload); 1 };
+        unless eval {
+            JSON::PP->new->encode($payload);
+            1;
+        };
+
+    # Reserve the response before invoking either REST or an inline HTTP sender.
     $self->{state} = 'responding';
     my $source = eval { $self->_send_initial_response($payload) };
     my $future = $self->_observe($source);
@@ -306,6 +357,8 @@ sub _initial {
 
 sub _send_initial_response {
     my ( $self, $payload ) = @_;
+
+    # HTTP delivery can answer inline; Gateway delivery uses the unauthenticated callback endpoint.
     return $self->{initial_sender}->($payload) if $self->{initial_sender};
     my $path = '/interactions/' . $self->{id} . '/' . uri_escape_utf8( $self->{token} ) . '/callback';
     return $self->_rest->request( 'POST', $path, auth => 0, json => $payload );
@@ -314,27 +367,33 @@ sub _send_initial_response {
 sub _complete_initial_response {
     my ( $self, $future, $next_state ) = @_;
     return if $self->{state} eq 'expired' || $self->{closed};
+
+    # Release delivery state and deadline before notifying acknowledgement observers.
     delete @{$self}{qw(initial_operation initial_source)};
     if ( my $timer = delete $self->{initial_timer} ) {
         $timer->cancel unless $timer->is_ready;
     }
 
+    # Only confirmed delivery enables webhook operations; failure remains non-retryable.
     if ( $future->is_done ) {
         $self->{state} = $next_state;
         $self->{acknowledgement}->done unless $self->{acknowledgement}->is_ready;
+        return;
     }
-    else {
-        $self->{state} = 'failed';
-        my $failure = $future;
-        unless ( $future->is_failed ) {
-            $failure = $self->_failed( 'Interaction response cancelled; delivery is uncertain', 'cancelled' );
-        }
-        $self->{acknowledgement}->fail( $failure->failure ) unless $self->{acknowledgement}->is_ready;
+
+    # Cancellation cannot distinguish a rejected response from one already delivered.
+    $self->{state} = 'failed';
+    my $failure = $future;
+    unless ( $future->is_failed ) {
+        $failure = $self->_failed( 'Interaction response cancelled; delivery is uncertain', 'cancelled' );
     }
+    $self->{acknowledgement}->fail( $failure->failure ) unless $self->{acknowledgement}->is_ready;
 }
 
 sub _rest {
     my ($self) = @_;
+
+    # Standalone contexts lazily create token-only REST and own its cleanup.
     unless ( $self->{rest} ) {
         $self->{rest} = Discord::Client::REST->new( auth => 0, loop => $self->{loop} );
         $self->{own_rest} = 1;
@@ -346,29 +405,39 @@ sub _observe {
     my ( $self, $source ) = @_;
     return $self->_failed( 'Interaction transport failed', 'transport' )
         unless blessed($source) && $source->isa('Future');
+
+    # Track operations so context shutdown can cancel both the observer and transport.
     my $future = $self->{loop}->new_future;
     my $key = refaddr($future);
     $self->{operations}{$key} = $future;
     $future->on_cancel( sub { $source->cancel unless $source->is_ready } );
+
+    # Detach completed work before forwarding its outcome to application callbacks.
     $source->on_ready(
         sub {
             delete $self->{operations}{$key};
             return if $future->is_ready;
-            if ( $source->is_done ) { $future->done( $source->result ) }
-            elsif ( $source->is_cancelled ) { $future->cancel }
-            else {
-                my ( undef, $category, $error ) = $source->failure;
-                my %fields;
-                if ( blessed($error) && $error->isa('Discord::Client::Error') ) {
-                    %fields = ( status => $error->status, discord_code => $error->discord_code );
-                    $self->{invalidated} = 1
-                        if ( $error->status // 0 ) == 401
-                        || ( $error->discord_code // 0 ) == 10015
-                        || ( $error->discord_code // 0 ) == 10062;
-                }
-                my $failed = $self->_failed( 'Interaction request failed', $category // 'transport', %fields );
-                $future->fail( $failed->failure );
+            if ( $source->is_done ) {
+                $future->done( $source->result );
+                return;
             }
+            if ( $source->is_cancelled ) {
+                $future->cancel;
+                return;
+            }
+
+            # Preserve useful error codes while excluding raw transport details and tokens.
+            my ( undef, $category, $error ) = $source->failure;
+            my %fields;
+            if ( blessed($error) && $error->isa('Discord::Client::Error') ) {
+                %fields = ( status => $error->status, discord_code => $error->discord_code );
+                $self->{invalidated} = 1
+                    if ( $error->status // 0 ) == 401
+                    || ( $error->discord_code // 0 ) == 10015
+                    || ( $error->discord_code // 0 ) == 10062;
+            }
+            my $failed = $self->_failed( 'Interaction request failed', $category // 'transport', %fields );
+            $future->fail( $failed->failure );
         }
     );
     return $future;
@@ -376,11 +445,15 @@ sub _observe {
 
 sub _webhook {
     my ( $self, $method, $suffix, %args ) = @_;
+
+    # Webhook operations require a confirmed acknowledgement and a still-valid token.
     return $self->_failed( 'Interaction is closed', 'shutdown' ) if $self->{closed};
     return $self->_failed( 'Interaction token expired or invalidated', 'expired' )
         if $self->{invalidated} || $self->{clock}->() >= $self->{expires_at};
     return $self->_failed( 'Interaction requires a confirmed initial response', 'state' )
         unless $self->{acknowledgement}->is_done;
+
+    # Escape the token as one path segment and never attach Bot authorization.
     my $source = eval {
         $self->_rest->request(
             $method, '/webhooks/'
@@ -390,7 +463,7 @@ sub _webhook {
                 . $suffix,
             auth => 0,
             %args
-        )
+        );
     };
     return $self->_observe($source);
 }
@@ -427,11 +500,18 @@ sub delete_followup {
 
 sub close {
     my ($self) = @_;
-    return $self->{loop}->new_future->done if $self->{closed}++;
-    if ( my $timer = delete $self->{initial_timer} ) { $timer->cancel unless $timer->is_ready }
+
+    # Stop the deadline and prevent future operations before cancelling current work.
+    return $self->{loop}->new_future->done if $self->{closed};
+    $self->{closed} = 1;
+    if ( my $timer = delete $self->{initial_timer} ) {
+        $timer->cancel unless $timer->is_ready;
+    }
     if ( !$self->{acknowledgement}->is_ready ) {
         $self->{acknowledgement}->fail( $self->_failed( 'Interaction is closed', 'shutdown' )->failure );
     }
+
+    # Use a snapshot because cancellation callbacks mutate the operation registry.
     my @operations = CORE::values %{ $self->{operations} };
     $_->cancel for grep { !$_->is_ready } @operations;
     $self->{operations} = {};
@@ -440,6 +520,8 @@ sub close {
 
 sub DESTROY {
     my ($self) = @_;
+
+    # Release lazily owned resources even when the caller simply drops the context.
     $self->{initial_timer}->cancel if $self->{initial_timer} && !$self->{initial_timer}->is_ready;
     $self->{rest}->close if $self->{own_rest};
 }

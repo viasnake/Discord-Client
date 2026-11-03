@@ -24,6 +24,8 @@ my @packages = qw(
     Discord::Client::Model::User
     Discord::Client::Error
 );
+
+# Do not let credentials inherited from the shell hide load-time dependencies.
 local $ENV{DISCORD_BOT_TOKEN};
 local $ENV{DISCORD_PUBLIC_KEY};
 for my $package (@packages) {

@@ -18,6 +18,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Allocate independent limits for active handlers, cached replies and retained IDs.
     my $loop = $args{loop} // IO::Async::Loop->new;
     my $self = bless {
         loop => $loop,
@@ -32,12 +34,16 @@ sub new {
         counters => {},
         on_error => $args{on_error}
     }, $class;
+
+    # Validate capacity and hooks before creating verification or transport resources.
     for my $key (qw(max_body max_replay max_seen replay_ttl)) {
         croak "$key must be a positive integer" unless !ref( $self->{$key} ) && $self->{$key} =~ /\A[1-9]\d*\z/;
     }
     for my $key (qw(clock delay on_error)) {
         croak "$key must be a code reference" if exists( $args{$key} ) && ref( $args{$key} ) ne 'CODE';
     }
+
+    # Verify signatures independently of command dispatch and token-only followup delivery.
     $self->{verifier} = Discord::Client::Interaction::Verifier->new(
         public_key => $args{public_key},
         ( exists( $args{wall_clock} ) ? ( wall_clock => $args{wall_clock} ) : () ),
@@ -51,6 +57,8 @@ sub new {
         application_id => $args{application_id}
     );
     $self->{own_commands} = !$args{commands};
+
+    # Dispatcher error callbacks must not keep the HTTP service alive.
     my $weak = $self;
     weaken($weak);
     $self->{dispatcher} = Discord::Client::Interactions->new(
@@ -66,10 +74,15 @@ sub new {
             return unless $weak;
             ++$weak->{counters}{handler_errors};
             if ( $weak->{on_error} ) {
-                my $ok = eval { $weak->{on_error}->(@_); 1 };
+                my $ok = eval {
+                    $weak->{on_error}->(@_);
+                    1;
+                };
                 warn "HTTP interaction error handler failed\n" unless $ok;
             }
-            else { warn $_[0]->message . "\n" }
+            else {
+                warn $_[0]->message . "\n";
+            }
         }
     );
     return $self;
@@ -94,6 +107,8 @@ sub component {
 
 sub _response {
     my ( $self, $status, $data ) = @_;
+
+    # Return PSGI bytes and a byte count, not a character count.
     my $body = JSON::PP->new->utf8->encode($data);
     return [ $status, [ 'Content-Type' => 'application/json', 'Content-Length' => length($body) ], [$body] ];
 }
@@ -111,6 +126,8 @@ sub _copy_response {
 
 sub _waiter {
     my ( $self, $source ) = @_;
+
+    # Each HTTP caller gets its own response copy and cannot cancel shared handler work.
     my $future = $self->{loop}->new_future;
     $source->on_ready(
         sub {
@@ -129,7 +146,9 @@ sub _waiter {
 
 sub handle {
     my ( $self, $headers, $body, %args ) = @_;
-    my $received = $args{received_at} // $self->{clock}->();
+
+    # Record arrival before verification so all admission time counts toward the deadline.
+    my $received_at = $args{received_at} // $self->{clock}->();
     ++$self->{counters}{requests};
     return $self->_done( 503, { error => 'Interaction service closed' } ) if $self->{closed};
     return $self->_done( 400, { error => 'Invalid request body' } ) unless defined($body) && !ref($body);
@@ -139,10 +158,13 @@ sub handle {
     my $signature = $normalized_headers{'x-signature-ed25519'};
     my $timestamp = $normalized_headers{'x-signature-timestamp'};
 
+    # Verify the exact signed octets before trusting or parsing JSON fields.
     unless ( $self->{verifier}->verify( $signature, $timestamp, $body ) ) {
         ++$self->{counters}{rejected_signatures};
         return $self->_done( 401, { error => 'Invalid request signature' } );
     }
+
+    # PING is a signature check and needs neither a command context nor replay storage.
     my $payload = eval { JSON::PP->new->utf8->decode($body) };
     return $self->_done( 400, { error => 'Invalid interaction JSON' } )
         if $@
@@ -151,16 +173,36 @@ sub handle {
         || ref( $payload->{type} );
     return $self->_done( 200, { type => 1 } ) if $payload->{type} eq '1';
 
-    # Expire completed IDs only; running work must remain protected from replay.
     my $now = $self->{clock}->();
+    $self->_expire_replay_records($now);
+
+    # Coalesce running duplicates and replay completed responses without rerunning handlers.
+    my $id = $payload->{id};
+    return $self->_done( 400, { error => 'Invalid interaction ID' } )
+        unless defined($id) && !ref($id) && $id =~ /\A\d+\z/;
+    my $replayed_response = $self->_replay_response($id);
+    return $replayed_response if $replayed_response;
+
+    return $self->_done( 503, { error => 'Interaction capacity exceeded' } )
+        if keys( %{ $self->{seen} } ) >= $self->{max_seen};
+    return $self->_dispatch_payload( $payload, $received_at, $now );
+}
+
+sub _expire_replay_records {
+    my ( $self, $now ) = @_;
+
+    # Expire completed IDs only; running work must remain protected from replay.
     for my $id ( keys %{ $self->{seen} } ) {
         next if $self->{pending}{$id} || $self->{seen}{$id} > $now;
         delete $self->{seen}{$id};
         delete $self->{replies}{$id};
     }
-    my $id = $payload->{id};
-    return $self->_done( 400, { error => 'Invalid interaction ID' } )
-        unless defined($id) && !ref($id) && $id =~ /\A\d+\z/;
+}
+
+sub _replay_response {
+    my ( $self, $id ) = @_;
+
+    # Pending work, cached bytes and retained IDs have different replay outcomes.
     if ( my $record = $self->{pending}{$id} ) {
         ++$self->{counters}{duplicates};
         return $self->_waiter( $record->{response} );
@@ -169,20 +211,20 @@ sub handle {
         ++$self->{counters}{duplicates};
         return $self->{loop}->new_future->done( _copy_response( $record->{response} ) );
     }
+
+    # Evicted response bytes do not permit the same side effects to run again.
     if ( exists $self->{seen}{$id} ) {
         ++$self->{counters}{duplicates};
         return $self->_done( 409, { error => 'Interaction response no longer cached' } );
     }
-    return $self->_done( 503, { error => 'Interaction capacity exceeded' } )
-        if keys( %{ $self->{seen} } ) >= $self->{max_seen};
-    return $self->_dispatch_payload( $payload, $received, $now );
+    return undef;
 }
 
 sub _dispatch_payload {
     my ( $self, $payload, $received_at, $now ) = @_;
     my $id = $payload->{id};
-    my $response = $self->{loop}->new_future;
-    my $record = { response => $response };
+    my $response_future = $self->{loop}->new_future;
+    my $record = { response => $response_future };
 
     # Reserve the ID before invoking application code, including reentrant calls.
     $self->{pending}{$id} = $record;
@@ -190,9 +232,11 @@ sub _dispatch_payload {
     my $work = $self->{dispatcher}->handle(
         $payload,
         received_at => $received_at,
-        initial_sender => sub { $self->_complete_inline_reply( $response, $_[0] ) },
+        initial_sender => sub { $self->_complete_inline_reply( $response_future, $_[0] ) },
     );
     $record->{work} = $work unless $work->is_ready;
+
+    # Release active ownership after both acknowledgement and application work settle.
     $work->on_ready(
         sub {
             delete $record->{work};
@@ -201,20 +245,20 @@ sub _dispatch_payload {
                 # Admission failed before any handler ran; retries may try again.
                 delete $self->{seen}{$id};
                 delete $self->{pending}{$id};
-                $self->_finish_unanswered_response( $response, $work );
+                $self->_finish_unanswered_response( $response_future, $work );
                 return;
             }
-            $self->_finish_unanswered_response( $response, $work );
-            $self->_cache_response( $id, $response ) unless $self->{closed};
+            $self->_finish_unanswered_response( $response_future, $work );
+            $self->_cache_response( $id, $response_future ) unless $self->{closed};
             delete $self->{pending}{$id};
         }
     );
-    return $self->_waiter($response);
+    return $self->_waiter($response_future);
 }
 
 sub _cache_response {
-    my ( $self, $id, $response ) = @_;
-    $self->{replies}{$id} = { response => ( $response->result )[0], order => ++$self->{reply_order} };
+    my ( $self, $id, $response_future ) = @_;
+    $self->{replies}{$id} = { response => ( $response_future->result )[0], order => ++$self->{reply_order} };
     return if keys( %{ $self->{replies} } ) <= $self->{max_replay};
 
     # Evict response bytes, retaining the ID so side effects cannot run twice.
@@ -224,25 +268,29 @@ sub _cache_response {
 }
 
 sub _complete_inline_reply {
-    my ( $self, $response, $reply ) = @_;
+    my ( $self, $response_future, $reply ) = @_;
+
+    # Accept at most one serializable inline response for the request.
     return $self->{loop}->new_future->fail( 'HTTP response is already complete', 'state' )
-        if $response->is_ready;
+        if $response_future->is_ready;
     my $wire = eval { $self->_response( 200, $reply ) };
     return $self->{loop}->new_future->fail( 'Invalid HTTP interaction response', 'request' ) unless $wire;
-    $response->done($wire);
+    $response_future->done($wire);
     return $self->{loop}->new_future->done;
 }
 
 sub _finish_unanswered_response {
-    my ( $self, $response, $work ) = @_;
-    return if $response->is_ready;
+    my ( $self, $response_future, $work ) = @_;
+    return if $response_future->is_ready;
+
+    # Map public failure categories to HTTP status without exposing private error details.
     my $status = 500;
     if ( $work->is_failed ) {
         my ( undef, $category ) = $work->failure;
         my %status_for = ( deadline => 504, protocol => 400, queue_full => 503 );
         $status = $status_for{$category} // 500;
     }
-    $response->done( $self->_response( $status, { error => 'Interaction could not be answered' } ) );
+    $response_future->done( $self->_response( $status, { error => 'Interaction could not be answered' } ) );
 }
 
 sub psgi_app {
@@ -252,6 +300,8 @@ sub psgi_app {
 
 sub _handle_psgi_request {
     my ( $self, $env ) = @_;
+
+    # Bound the POST body before reading from the host-provided input stream.
     my $received_at = $self->{clock}->();
     return $self->_response( 405, { error => 'POST required' } ) unless ( $env->{REQUEST_METHOD} // '' ) eq 'POST';
     my $length = $env->{CONTENT_LENGTH};
@@ -259,6 +309,7 @@ sub _handle_psgi_request {
         unless defined($length) && $length =~ /\A\d+\z/;
     return $self->_response( 413, { error => 'Request body too large' } ) if $length > $self->{max_body};
 
+    # Preserve request bytes for signature validation; reject incomplete host input.
     my $body = eval { _read_psgi_body( $env->{'psgi.input'}, $length ) };
     return $self->_response( 400, { error => 'Incomplete request body' } ) if $@;
     my $future = $self->handle(
@@ -271,6 +322,7 @@ sub _handle_psgi_request {
     );
     return $future->get if $future->is_ready;
 
+    # Only streaming hosts can wait asynchronously for an unanswered interaction.
     unless ( $env->{'psgi.streaming'} ) {
         return $self->_reject_pending_psgi_response($body);
     }
@@ -283,6 +335,8 @@ sub _handle_psgi_request {
 sub _read_psgi_body {
     my ( $input, $length ) = @_;
     my $body = '';
+
+    # PSGI input may return short chunks; zero bytes before Content-Length is a failure.
     while ( length($body) < $length ) {
         my $read = $input->read( my $chunk, $length - length($body) );
         die 'Short request body' unless defined($read) && $read > 0;
@@ -293,6 +347,8 @@ sub _read_psgi_body {
 
 sub _reject_pending_psgi_response {
     my ( $self, $body ) = @_;
+
+    # A synchronous host cannot keep an unanswered handler running after returning 503.
     my $payload = eval { JSON::PP->new->utf8->decode($body) };
     my $record = ref($payload) eq 'HASH' ? $self->{pending}{ $payload->{id} // '' } : undef;
     if ($record) {
@@ -315,6 +371,8 @@ sub stats {
 
 sub close {
     my ($self) = @_;
+
+    # Answer outstanding HTTP callers before cancelling dispatcher work and owned resources.
     $self->{closed} = 1;
     for my $record ( values %{ $self->{pending} } ) {
         $record->{response}->done( $self->_response( 503, { error => 'Interaction service closed' } ) )

@@ -10,21 +10,29 @@ sub name { $_[0]->get('name') }
 
 sub refresh {
     my ( $self, %query ) = @_;
+
+    # Forward query options and return a fresh guild snapshot.
     my $request = $self->_call( get_guild => $self->id, %query );
     return $self->_model_future( guild => $request );
 }
 
 sub fetch_member {
     my ( $self, $user_id ) = @_;
+
+    # Member data remains raw; the SDK does not maintain a member cache.
     return $self->_call( get_guild_member => $self->id, $user_id );
 }
 
 sub channels {
     my ($self) = @_;
+
+    # Fetch the collection once and wrap each returned channel without more I/O.
     my $request = $self->_call( get_guild_channels => $self->id );
     return $request->then(
         sub {
             my ($data) = @_;
+
+            # Reject an invalid collection or resource as one protocol failure.
             my $models = eval {
                 die 'invalid list' unless ref($data) eq 'ARRAY';
                 [ map { Discord::Client::Model->wrap( channel => $_, rest => $self->{rest} ) } @$data ];

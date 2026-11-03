@@ -6,7 +6,15 @@ use warnings;
 use overload '""' => sub { $_[0]->{message} }, fallback => 1;
 
 our $VERSION = '0.001';
-sub new { my ( $class, %args ) = @_; return bless \%args, $class }
+
+sub new {
+    my ( $class, %args ) = @_;
+
+    # Producers sanitize their own fields; this value object preserves them as supplied.
+    return bless \%args, $class;
+}
+
+# Accessors expose optional diagnostic fields without interpreting transport payloads.
 sub message { $_[0]->{message} }
 sub category { $_[0]->{category} }
 sub status { $_[0]->{status} }

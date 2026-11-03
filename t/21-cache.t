@@ -12,7 +12,11 @@ T2->subtest(
     'bounded snapshots, LRU and TTL',
     sub {
         my $now = 0;
+
+        # Byte and per-entry limits apply independently of the entry-count limit.
         my $cache = Discord::Client::Cache->new( max_items => 2, ttl => 10, clock => sub { $now } );
+
+        # Inputs and returned values must not expose the stored nested snapshot.
         my $raw = { id => '1', nested => { new_field => 'preserved' } };
         $cache->put( user => $raw );
         $raw->{nested}{new_field} = 'changed';
@@ -20,11 +24,15 @@ T2->subtest(
         T2->is( $copy->{nested}{new_field}, 'preserved', 'input snapshot isolated' );
         $copy->{nested}{new_field} = 'changed again';
         T2->is( $cache->get( user => '1' )->{nested}{new_field}, 'preserved', 'output snapshot isolated' );
+
+        # Accessing the first entry makes the second entry the next eviction candidate.
         $cache->put( user => { id => '2' } );
         $cache->get( user => '1' );
         $cache->put( user => { id => '3' } );
         T2->ok( !defined( $cache->get( user => '2' ) ), 'least recently used evicted' );
         T2->is( $cache->stats->{items}, 2, 'item count bounded' );
+
+        # Expiry applies at the exact boundary and releases byte accounting.
         $now = 10;
         T2->is( $cache->stats->{items}, 0, 'expiry also enforced on stats' );
         T2->is( $cache->stats->{bytes}, 0, 'expired byte accounting released' );
@@ -66,11 +74,15 @@ T2->subtest(
                 unknown => 1
             }
         );
+
+        # Partial updates replace supplied fields while retaining omitted and unknown fields.
         $cache->apply( 'MESSAGE_UPDATE', { id => '4', content => 'new', embeds => [] } );
         my $message = $cache->get( message => '4' );
         T2->is( $message->{content}, 'new', 'partial update merged' );
         T2->is( $message->{channel_id}, '2', 'omitted field retained' );
         T2->is( $message->{unknown}, 1, 'unknown field retained' );
+
+        # Temporary unavailability preserves related snapshots until the guild returns.
         $cache->apply( 'GUILD_DELETE', { id => '1', unavailable => JSON::PP::true } );
         T2->ok( $cache->get( guild => '1' )->{unavailable}, 'temporary unavailable recorded' );
         T2->ok( $cache->get( message => '4' ), 'temporary outage retains snapshots' );
@@ -78,6 +90,8 @@ T2->subtest(
         T2->ok( $cache->get( guild => '1' )->{unavailable}, 'unavailable GUILD_CREATE remains unavailable' );
         $cache->apply( 'GUILD_CREATE', { id => '1', name => 'Back' } );
         T2->ok( !$cache->get( guild => '1' )->{unavailable}, 'available GUILD_CREATE clears flag' );
+
+        # Permanent deletion removes related data but preserves independently shared users.
         $cache->apply( 'MESSAGE_DELETE_BULK', { ids => ['4'] } );
         T2->ok( !defined( $cache->get( message => '4' ) ), 'bulk delete removes messages' );
         $cache->apply( 'MESSAGE_CREATE', { id => '5', guild_id => '1', channel_id => '2' } );
@@ -94,6 +108,8 @@ T2->subtest(
 T2->subtest(
     'selected types and facade event ordering',
     sub {
+
+        # A separate default client must not allocate a cache implicitly.
         my ($rest) = client();
         my $rig = rig( loop => $rest->loop );
         my $bot = Discord::Client->new(
@@ -102,12 +118,14 @@ T2->subtest(
             loop => $rest->loop,
             cache => { types => ['message'] }
         );
+
+        # Application callbacks must observe the cache after the incoming event is applied.
         my $seen;
         $bot->on( message_create => sub { $seen = $_[2]->cache->get( message => $_[0]{id} ) } );
         my $started = $bot->start;
-        my $ws = ready_socket($rig);
+        my $websocket = ready_socket($rig);
         $started->get;
-        $ws->emit(
+        $websocket->emit(
             {
                 op => 0,
                 s => 43,

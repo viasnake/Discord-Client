@@ -11,6 +11,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Import only an exact Ed25519 public key, then configure the local freshness policy.
     croak 'public_key must be a 32-byte hexadecimal Ed25519 public key'
         unless defined( $args{public_key} ) && !ref( $args{public_key} ) && $args{public_key} =~ /\A[0-9a-fA-F]{64}\z/;
     my $key = eval { Crypt::PK::Ed25519->new->import_key_raw( pack( 'H*', $args{public_key} ), 'public' ) };
@@ -23,6 +25,8 @@ sub new {
 
 sub verify {
     my ( $self, $signature, $timestamp, $body ) = @_;
+
+    # Reject malformed signatures, timestamps and decoded text before cryptographic work.
     return 0
         unless defined($signature)
         && !ref($signature)
@@ -33,6 +37,8 @@ sub verify {
         && defined($body)
         && !ref($body)
         && !utf8::is_utf8($body);
+
+    # Timestamp tolerance is a local replay policy, independent of signature validity.
     return 0 if $self->{max_age} && abs( $self->{wall_clock}->() - $timestamp ) > $self->{max_age};
 
     # Verify the exact timestamp and body octets before JSON parsing.

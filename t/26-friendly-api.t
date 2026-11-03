@@ -21,6 +21,8 @@ sub setup {
         gateway => $gateway->{gateway},
         on_error => sub { push @errors, $_[0] },
     );
+
+    # Complete startup through Gateway frames before returning an actionable client fixture.
     my $started = $bot->start;
     my $socket = ready_socket($gateway);
     $gateway->{clock}->run_deferred;
@@ -100,7 +102,12 @@ T2->subtest(
 
         # A failing handler must not prevent the next listener from seeing the event.
         $bot->on_message( sub { die 'private handler details' } );
-        $bot->on_message( sub { ++$calls; return $pending } );
+        $bot->on_message(
+            sub {
+                ++$calls;
+                return $pending;
+            }
+        );
         dispatch_message( $gateway, $socket, message_data() );
         T2->is( $calls, 1, 'next listener still runs' );
         T2->is( $errors->[0]->category, 'handler', 'failure reaches the existing error hook' );
@@ -197,7 +204,7 @@ T2->subtest(
             [
                 'six buttons',
                 sub {
-                    row( map { button( "id$_", label => 'Press' ) } 1 .. 6 )
+                    row( map { button( "id$_", label => 'Press' ) } 1 .. 6 );
                 },
                 qr/action row/
             ],
