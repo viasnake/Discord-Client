@@ -27,7 +27,10 @@ my $deployed = eval {
 my $deployment_error = $@;
 
 # Close SDK resources even when deployment fails, preserving the original error.
-my $closed = eval { $bot->close->get; 1 };
+my $closed = eval {
+    $bot->close->get;
+    1;
+};
 my $close_error = $@;
 die $deployment_error unless $deployed;
 die $close_error unless $closed;

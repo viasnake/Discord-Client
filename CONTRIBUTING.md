@@ -33,6 +33,15 @@ Split responsibilities into functions when that makes the flow easier to follow.
 Comment each logical processing group in English. Explain its purpose,
 ordering or constraints without repeating each statement.
 
+Follow [perlstyle](https://perldoc.perl.org/perlstyle): separate logical groups
+with blank lines and expand blocks containing multiple processing steps.
+Keep simple accessors concise. Prefer early returns for invalid inputs and
+completed cases so the main path does not accumulate nesting.
+
+Give each function one clear responsibility. Compose the existing components
+through explicit inputs and Future results; keep network access, scheduling
+and application callbacks at their existing boundaries.
+
 Use four spaces per indentation level, including continued statements.
 Do not pad assignments, hash pairs, method definitions or comments to align
 with adjacent lines. The formatter adjusts line breaks to a 120-column limit.

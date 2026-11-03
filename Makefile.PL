@@ -2,6 +2,7 @@ use strict;
 use warnings;
 use ExtUtils::MakeMaker;
 
+# Declare install requirements and indexing boundaries in one distribution definition.
 WriteMakefile(
     NAME => 'Discord::Client',
     VERSION_FROM => 'lib/Discord/Client.pm',

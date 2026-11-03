@@ -18,6 +18,8 @@ $bot->command(
         description => 'Replies with Pong',
         handler => sub {
             my ($interaction) = @_;
+
+            # Return asynchronous work to the dispatcher for error handling and shutdown.
             return $interaction->reply('Pong!');
         },
     ),

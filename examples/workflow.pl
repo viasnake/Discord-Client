@@ -16,12 +16,17 @@ my $bot = Discord::Client->new(
 sub prepare_report {
     my ( $interaction, $bot ) = @_;
 
+    # Chain each stage so cancellation propagates from the reply back to the pending delay.
     return $interaction->defer( ephemeral => 1 )->then(
         sub {
+
+            # Yield to the shared loop while waiting; Gateway heartbeats continue to run.
             return $bot->loop->delay_future( after => 1 );
         }
     )->then(
         sub {
+
+            # Complete the acknowledged private response after the simulated work finishes.
             return $interaction->reply('Your report is ready.');
         }
     );

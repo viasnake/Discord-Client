@@ -17,6 +17,7 @@ sub greet {
     my ($interaction) = @_;
     my $name = $interaction->option('name');
 
+    # Treat the supplied name as text so it cannot trigger a mention.
     return $interaction->reply(
         {
             content => "Hello, $name!",

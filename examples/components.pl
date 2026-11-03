@@ -19,6 +19,8 @@ $bot->command(
         description => 'Show a button',
         handler => sub {
             my ($interaction) = @_;
+
+            # Build the visible control with the same ID registered by the component handler.
             return $interaction->reply(
                 {
                     content => 'Press the button.',
@@ -33,6 +35,8 @@ $bot->command(
 $bot->component(
     hello => sub {
         my ($interaction) = @_;
+
+        # Keep the button response private to the person who clicked it.
         return $interaction->reply( 'Hello!', ephemeral => 1 );
     }
 );

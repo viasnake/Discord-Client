@@ -19,6 +19,8 @@ $bot->command(
         description => 'Send feedback',
         handler => sub {
             my ($interaction) = @_;
+
+            # Declare the field once; its ID is also used when reading the submission.
             return $interaction->modal(
                 modal(
                     'feedback_form',
@@ -42,8 +44,11 @@ $bot->command(
 $bot->component(
     feedback_form => sub {
         my ($interaction) = @_;
+
+        # Read the submitted field by its declared ID, independently of the component layout.
         my $note = $interaction->field('note');
 
+        # Echo the note privately and disable mentions in user-supplied text.
         return $interaction->reply(
             {
                 content => "Thanks for your feedback: $note",

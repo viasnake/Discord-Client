@@ -4,6 +4,7 @@ use Test2::V1;
 use CPAN::Meta;
 use CPAN::Meta::Validator;
 
+# The source checkout has no generated metadata; disttest exercises these checks.
 T2->skip_all('Generated metadata is checked in the make disttest tree')
     unless -f 'META.json';
 
@@ -48,6 +49,8 @@ T2->subtest(
         );
         T2->ok( $test_requirements->accepts_module( 'Test2::V1', '1.302217' ),
             'the minimum supported test bundle is accepted' );
+
+        # Consumers should not need the test framework to run an installed client.
         my $runtime_requirements = $metadata->effective_prereqs->requirements_for( 'runtime', 'requires' );
         T2->ok(
             !grep( $_ eq 'Test2::V1', $runtime_requirements->required_modules ),
@@ -61,10 +64,14 @@ T2->subtest(
     'test fixtures and internal packages are excluded from CPAN indexing',
     sub {
         for my $file (
-            qw(t/lib/TestDiscordREST.pm t/lib/TestDiscordGateway.pm t/lib/TestDiscordExamples.pm examples/ping.pl))
+            qw(t/lib/TestDiscordREST.pm t/lib/TestDiscordGateway.pm t/lib/TestDiscordExamples.pm
+            t/lib/TestDiscordTLS.pm examples/ping.pl)
+            )
         {
             T2->ok( !$metadata->should_index_file($file), "$file is excluded" );
         }
+
+        # Source files are shipped, but implementation packages are not public CPAN APIs.
         my @internal_packages = qw(
             Discord::Client::Gateway::Session
             Discord::Client::Gateway::IdentifyLimiter

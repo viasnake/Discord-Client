@@ -12,6 +12,8 @@ $service->command(
         description => 'Replies with Pong',
         handler => sub {
             my ($interaction) = @_;
+
+            # Return the reply Future so delivery failures remain visible to the dispatcher.
             return $interaction->reply('Pong!');
         },
     ),

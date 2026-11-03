@@ -14,12 +14,17 @@ sub load_example {
     my $constructor = Discord::Client->can('new');
 
     # Exercise the real script while injecting controlled public SDK dependencies.
-    no warnings 'redefine';
-    local *Discord::Client::new = sub {
-        my ( $class, %arguments ) = @_;
-        return $constructor->( $class, %arguments, %options );
-    };
-    my $bot = do File::Spec->rel2abs($path);
+    my $bot;
+    {
+        no warnings 'redefine';
+        local *Discord::Client::new = sub {
+            my ( $class, %arguments ) = @_;
+            return $constructor->( $class, %arguments, %options );
+        };
+        $bot = do File::Spec->rel2abs($path);
+    }
+
+    # Restore the constructor before inspecting the example's returned client.
     die "Could not load example $path: $@ $!"
         unless blessed($bot) && $bot->isa('Discord::Client');
     return $bot;

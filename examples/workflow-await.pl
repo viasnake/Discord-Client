@@ -17,8 +17,13 @@ my $bot = Discord::Client->new(
 async sub prepare_report_async {
     my ( $interaction, $bot ) = @_;
 
+    # Acknowledge before work begins so it may outlive the initial-response deadline.
     await $interaction->defer( ephemeral => 1 );
+
+    # Suspend on a Future rather than blocking the shared event loop.
     await $bot->loop->delay_future( after => 1 );
+
+    # Wait for the final reply so its failure belongs to the handler Future.
     await $interaction->reply('Your report is ready.');
 }
 

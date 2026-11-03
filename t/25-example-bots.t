@@ -89,6 +89,8 @@ sub response_body {
 sub close_clients {
     my ($fixture) = @_;
     T2->is( scalar( @{ $fixture->{errors} } ), 0, 'no handler errors' );
+
+    # Close the facade and caller-owned REST client before checking both timer registries.
     $fixture->{bot}->close->get;
     $fixture->{rest}->close->get;
     T2->is( $fixture->{clock}->timer_count, 0, 'no interaction or Gateway timers after shutdown' );
@@ -251,7 +253,10 @@ T2->subtest(
 T2->subtest(
     'Future and optional async/await examples complete work and cancel it on shutdown',
     sub {
-        my $has_async_await = eval { require Future::AsyncAwait; 1 };
+        my $has_async_await = eval {
+            require Future::AsyncAwait;
+            1;
+        };
         for my $example ( 'workflow', 'workflow-await' ) {
             T2->subtest(
                 $example,
@@ -327,7 +332,13 @@ T2->subtest(
         local @ARGV = ('examples/ping.pl');
         local $ENV{TEST_GUILD_ID} = '789';
 
-        T2->try_ok( sub { do './examples/sync-commands.pl'; die $@ if $@ }, 'deployment script completes' );
+        T2->try_ok(
+            sub {
+                do './examples/sync-commands.pl';
+                die $@ if $@;
+            },
+            'deployment script completes'
+        );
         T2->is( $http->count, 1, 'one explicit deployment; no Gateway discovery' );
         T2->is( $http->call->{request}->method, 'PUT', 'bulk command replacement' );
         T2->like( $http->call->{request}->uri->path, qr{/applications/456/guilds/789/commands$}, 'guild scope' );
