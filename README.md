@@ -8,6 +8,12 @@ Unofficial; not affiliated with or endorsed by Discord.
 
 ## Install
 
+From CPAN:
+
+```sh
+cpanm Discord::Client
+```
+
 From a source checkout:
 
 ```sh
