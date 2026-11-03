@@ -9,6 +9,8 @@ use Discord::Client::Commands;
 
 sub registry {
     my (%options) = @_;
+
+    # Share the controlled REST client with a registry that performs no startup I/O.
     my ( $rest, $http ) = client();
     my $commands = Discord::Client::Commands->new(
         rest => $rest,
@@ -30,6 +32,8 @@ T2->subtest(
             [ { name => 'ping', type => 1, description => 'Ping' } ],
             'the wire declaration contains data, not its callback'
         );
+
+        # Mutating an exported definition must not change later deployment snapshots.
         my $snapshot = $commands->definitions;
         $snapshot->[0]{name} = 'modified';
         T2->is( $commands->definitions->[0]{name}, 'ping', 'editing a snapshot does not change the registry' );
@@ -252,6 +256,7 @@ T2->subtest(
         $commands->define( ping => description => 'Ping', handler => sub { } );
         my $declarations = $commands->definitions;
 
+        # Freeze the deployment contents before application discovery can complete.
         my $synchronization = $commands->sync( scope => { guild_id => '789' } );
         T2->is(
             $http->call->{request}->uri->path,
@@ -261,6 +266,7 @@ T2->subtest(
         $commands->define( later => description => 'Added during discovery', handler => sub { } );
         $http->respond( response( 200, { id => '456' } ) );
 
+        # Only the frozen declarations may reach the requested guild.
         my $request = $http->call->{request};
         T2->is( $request->method, 'PUT', 'synchronization bulk-overwrites commands' );
         T2->is(
@@ -292,6 +298,8 @@ T2->subtest(
             '/api/v10/applications/456/commands',
             'the default scope is global'
         );
+
+        # Cancelling deployment must reach the single outstanding transport request.
         $synchronization->cancel;
         T2->ok( $http->call->{future}->is_cancelled, 'cancellation reaches the HTTP transport' );
 
@@ -309,6 +317,49 @@ T2->subtest(
         T2->is( error($synchronization)->category, 'request', 'invalid scope returns a request failure' );
         T2->is( $http->count, 0, 'no request is sent for the invalid scope' );
 
+        $commands->close;
+        $rest->close;
+    }
+);
+
+T2->subtest(
+    'choice JSON follows its declared option type during deployment',
+    sub {
+        # Perl scalar flags must not decide the JSON type of a Discord choice.
+        my ( $commands, $rest, $http ) = registry( application_id => '456' );
+        $commands->define(
+            choose => description => 'Choose a code',
+            handler => sub { },
+            options => [
+                {
+                    name => 'text',
+                    description => 'Text',
+                    type => 'string',
+                    choices => [ { name => 'One', value => 1 } ]
+                },
+                {
+                    name => 'integer',
+                    description => 'Integer',
+                    type => 'integer',
+                    choices => [ { name => 'Two', value => '2' } ]
+                },
+                {
+                    name => 'number',
+                    description => 'Number',
+                    type => 'number',
+                    choices => [ { name => 'Half', value => '0.5' } ]
+                },
+            ]
+        );
+
+        # Inspect the actual request bytes; Perl value equality hides type errors.
+        my $synced = $commands->sync;
+        my $body = $http->call->{request}->content;
+        T2->like( $body, qr/"value":"1"/, 'string choice is encoded as a string' );
+        T2->like( $body, qr/"value":2\b/, 'integer choice is encoded as a number' );
+        T2->like( $body, qr/"value":0\.5\b/, 'number choice retains its fraction' );
+        $http->respond( response( 200, [] ) );
+        T2->ok( $synced->is_done, 'deployment completes' );
         $commands->close;
         $rest->close;
     }
