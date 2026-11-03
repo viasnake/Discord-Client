@@ -5,6 +5,8 @@ use Discord::Client::Gateway::Session;
 
 sub ready_session {
     my $session = Discord::Client::Gateway::Session->new( token => 'FAKE', random => sub { 0.5 } );
+
+    # Establish resumable state through a complete handshake before testing failures.
     $session->opened;
     $session->receive( { op => 10, d => { heartbeat_interval => 1000 } } );
     $session->receive(
@@ -24,6 +26,7 @@ T2->subtest(
         my $session = ready_session();
         $session->heartbeat_due;
 
+        # Leave the first beat unacknowledged and let the next interval detect the failure.
         my $actions = $session->heartbeat_due;
 
         T2->is(
@@ -39,6 +42,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Force a fresh session while retaining the mandated random reconnect delay.
         my $actions = $session->receive( { op => 9, d => 0 } );
 
         T2->is(
@@ -55,6 +59,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Exercise the same delay with a session Discord permits us to resume.
         my $actions = $session->receive( { op => 9, d => 1 } );
 
         T2->is(
@@ -65,6 +70,7 @@ T2->subtest(
     }
 );
 
+# Configuration and authentication close codes terminate instead of reconnecting.
 for my $code ( 4004, 4010, 4011, 4012, 4013, 4014 ) {
     T2->subtest(
         "fatal close code $code stops the session without reconnecting",
@@ -83,6 +89,7 @@ for my $code ( 4004, 4010, 4011, 4012, 4013, 4014 ) {
     );
 }
 
+# These recoverable closes reconnect with a fresh Identify rather than stale state.
 for my $code ( 1000, 1001, 4007, 4009 ) {
     T2->subtest(
         "close code $code requires a new Identify",
@@ -105,6 +112,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # An interrupted socket alone does not invalidate the session identity.
         my $actions = $session->closed(1006);
 
         T2->is(
@@ -120,6 +128,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Preserve future opcodes for consumers instead of treating them as parser errors.
         my $actions = $session->receive( { op => 99, d => { x => 1 } } );
 
         T2->is(
@@ -135,6 +144,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # An invalid transition must not overwrite an already authenticated session.
         T2->like(
             T2->dies( sub { $session->receive( { op => 10, d => { heartbeat_interval => 1000 } } ) } ),
             qr/HELLO received outside handshake/,
@@ -151,6 +161,7 @@ T2->subtest(
         my $session = Discord::Client::Gateway::Session->new( token => 'FAKE' );
         $session->opened;
 
+        # Reject malformed handshake data before installing heartbeat state.
         T2->like(
             T2->dies( sub { $session->receive( { op => 10, d => undef } ) } ),
             qr/HELLO payload must be a hashref/,

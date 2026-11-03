@@ -15,6 +15,8 @@ our $VERSION = '0.001';
 sub new {
     my ( $class, %args ) = @_;
     my $self = bless { %args, closed => 0 }, $class;
+
+    # The adapter owns its socket; callbacks must not create an ownership cycle.
     my $weak = $self;
     weaken($weak);
     my $client = Discord::Client::Gateway::WebSocket::Client->new(
@@ -37,6 +39,8 @@ sub new {
 
 sub connect {
     my ( $self, $url ) = @_;
+
+    # Require TLS in production and force peer and hostname verification.
     my $uri = URI->new($url);
     croak 'Gateway URL must use WSS'
         unless ( $uri->scheme // '' ) eq 'wss'
@@ -53,13 +57,18 @@ sub send { $_[0]->{client}->send_text_frame( $_[1] ) }
 
 sub _notify {
     my ( $self, $code ) = @_;
-    return if $self->{closed}++;
+
+    # Notify the driver once even if read, write and close events arrive together.
+    return if $self->{closed};
+    $self->{closed} = 1;
     $self->{on_close}->($code);
     $self->_dispose;
 }
 
 sub _dispose {
     my ($self) = @_;
+
+    # Disconnect callbacks before closing the stream to prevent recursive notification.
     $self->{client}->configure(
         map { $_ => undef }
             qw(on_text_frame on_binary_frame on_close_frame
@@ -70,6 +79,8 @@ sub _dispose {
 
 sub abort {
     my ($self) = @_;
+
+    # Abort immediately without waiting for a close frame to reach the peer.
     $self->{closed} = 1;
     $self->_dispose;
     return $self->{loop}->new_future->done;
@@ -77,10 +88,14 @@ sub abort {
 
 sub close {
     my ( $self, $code ) = @_;
+
+    # Without a connected write handle there is no close frame to flush.
     return $self->abort unless $self->{client}->write_handle;
     $self->{closed} = 1;
     my $write = eval { $self->{client}->send_close_frame( pack( 'n', $code // 1000 ) ) };
     return $self->abort unless $write;
+
+    # Bound graceful shutdown even if the peer stops reading close frames.
     my $timeout = $self->{loop}->delay_future( after => 1 );
     my $wait = Future->wait_any( $write, $timeout );
     my $result = $self->{loop}->new_future;
@@ -90,6 +105,8 @@ sub close {
             $result->done unless $result->is_ready;
         }
     );
+
+    # Cancellation still disposes the socket and its remaining waiters.
     $result->on_cancel(
         sub {
             $wait->cancel;
@@ -106,6 +123,8 @@ use parent 'Net::Async::WebSocket::Client';
 sub _init {
     my ($self) = @_;
     $self->SUPER::_init;
+
+    # Bound inbound frames before they can accumulate unbounded payload bytes.
     $self->{framebuffer} = Protocol::WebSocket::Frame->new( max_payload_size => 16 * 1024 * 1024 );
 }
 
@@ -117,6 +136,8 @@ sub configure {
 
 sub on_read {
     my ( $self, @args ) = @_;
+
+    # Translate parser exceptions into a protocol close instead of escaping the loop.
     my $result = eval { $self->SUPER::on_read(@args) };
     if ($@) {
         $self->{on_parser_error}->() if $self->{on_parser_error};
@@ -127,6 +148,8 @@ sub on_read {
 
 sub _do_handshake {
     my ( $self, @args ) = @_;
+
+    # Watch the HTTP upgrade parser separately from the established frame reader.
     my $future = $self->SUPER::_do_handshake(@args);
     my $reader = $self->can_event('on_read');
     $self->SUPER::configure(

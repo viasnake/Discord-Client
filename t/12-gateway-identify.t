@@ -9,6 +9,8 @@ use TestDiscordGateway qw(gateway_info);
 
 sub limiter {
     my (%args) = @_;
+
+    # Use a shared controlled clock and scripted discovery results for permit scheduling.
     my $clock = bless { now => 0, timers => [] }, 'TestDiscordGateway::Clock';
     my $rest = bless {
         calls => [],
@@ -30,6 +32,8 @@ T2->subtest(
     sub {
         my ( $limiter, $clock, $rest ) =
             limiter( responses => [ gateway_info( max_concurrency => 2, remaining => 3, reset_after => 60000 ), ] );
+
+        # Different modulo buckets can reserve starts together while the same bucket waits.
         my $zero = $limiter->acquire(0);
         my $one = $limiter->acquire(1);
         my $two = $limiter->acquire(2);
@@ -37,6 +41,8 @@ T2->subtest(
             'separate Identify buckets start concurrently' );
         $clock->advance(8);
         T2->ok( !$two->is_ready, 'unsent reserved permit cannot allow another Identify' );
+
+        # Cooldown begins at actual send time, not when the reservation was issued.
         $zero->get->commit;
         $one->get->commit;
         $clock->advance(4.99);
@@ -54,6 +60,8 @@ T2->subtest(
     sub {
         my ( $limiter, $clock, $rest ) =
             limiter( responses => [ gateway_info( remaining => 1 ), gateway_info( remaining => 5 ) ] );
+
+        # Consume the only start and wait for server metadata instead of inventing a new budget.
         $limiter->acquire(0)->get->commit;
         my $next = $limiter->acquire(1);
         $clock->advance(9.99);
@@ -69,7 +77,6 @@ T2->subtest(
 T2->subtest(
     'zero reset delay retains budget and Identify cooldown',
     sub {
-
         # Zero-reset metadata is usable without refetching an available budget.
         my ( $limiter, $clock, $rest ) =
             limiter( responses => [ gateway_info( remaining => 2, reset_after => 0 ) ] );
@@ -96,7 +103,6 @@ T2->subtest(
 T2->subtest(
     'exhausted zero reset delay refreshes without a busy loop',
     sub {
-
         # Metadata remains exhausted once, then supplies two available starts.
         my ( $limiter, $clock, $rest ) = limiter(
             responses => [
@@ -136,6 +142,8 @@ T2->subtest(
     'negative reset delay is rejected',
     sub {
         my ($limiter) = limiter( responses => [ gateway_info( reset_after => -1 ) ] );
+
+        # Reject malformed discovery before granting a permit.
         my $info = $limiter->info;
         T2->is( error($info)->category, 'protocol', 'negative reset delay fails discovery' );
         $limiter->close;
@@ -145,7 +153,10 @@ T2->subtest(
 T2->subtest(
     'cancellation, bounds and invalid discovery',
     sub {
+        # Keep discovery pending so queue capacity and cancellation are observable.
         my $pending = Future->new;
+
+        # A separate malformed discovery must fail queued acquisition without a send.
         my ( $limiter, $clock ) = limiter( responses => [$pending], max_pending => 1 );
         my $first_acquisition = $limiter->acquire(0);
         my $full = $limiter->acquire(1);

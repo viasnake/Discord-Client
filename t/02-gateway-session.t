@@ -4,6 +4,8 @@ use Test2::V1;
 use Discord::Client::Gateway::Session;
 
 sub new_session {
+
+    # Fix randomness so heartbeat jitter and reconnect delays are reproducible.
     return Discord::Client::Gateway::Session->new(
         token => 'FAKE_TEST_TOKEN',
         intents => [ 'GUILDS', 'GUILD_MESSAGES' ],
@@ -13,6 +15,8 @@ sub new_session {
 
 sub begin_handshake {
     my $session = new_session();
+
+    # Drive the public session transition before delivering HELLO.
     $session->opened;
     $session->receive( { op => 10, d => { heartbeat_interval => 40000 } } );
     return $session;
@@ -38,6 +42,7 @@ T2->subtest(
     sub {
         my $session = new_session();
 
+        # Opening a socket must not spend an Identify before Discord supplies HELLO.
         T2->is( $session->state, 'disconnected', 'a new session has no connection' );
         T2->is( $session->opened, [], 'opening alone emits no action' );
         T2->is( $session->state, 'awaiting_hello', 'authentication waits for HELLO' );
@@ -50,6 +55,7 @@ T2->subtest(
         my $session = new_session();
         $session->opened;
 
+        # Negotiate the interval with fixed randomness so the initial jitter is exact.
         my $actions = $session->receive( { op => 10, d => { heartbeat_interval => 40000 } } );
 
         T2->is(
@@ -69,6 +75,7 @@ T2->subtest(
         my $session = begin_handshake();
         my $packet = ready_packet();
 
+        # Deliver READY and inspect both the emitted event and the retained resume identity.
         my $actions = $session->receive($packet);
 
         T2->is(
@@ -87,6 +94,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Issue a heartbeat against the most recent dispatch sequence.
         my $actions = $session->heartbeat_due;
 
         T2->is(
@@ -95,6 +103,8 @@ T2->subtest(
             'the heartbeat contains the last dispatch sequence'
         );
         T2->ok( $session->heartbeat_pending, 'the heartbeat waits for acknowledgment' );
+
+        # Acknowledge the beat before another interval can declare the socket unhealthy.
         $session->receive( { op => 11 } );
         T2->ok( !$session->heartbeat_pending, 'ACK clears the outstanding heartbeat' );
     }
@@ -105,6 +115,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Ask the session to reconnect while its previous identity is still resumable.
         my $actions = $session->receive( { op => 7 } );
 
         T2->is(
@@ -112,6 +123,8 @@ T2->subtest(
             [ { action => 'reconnect', resume => 1, delay_ms => 0 } ],
             'the driver reconnects immediately with resume data'
         );
+
+        # Negotiate a replacement socket and confirm Resume uses the saved sequence.
         $session->opened;
         $actions = $session->receive( { op => 10, d => { heartbeat_interval => 40000 } } );
         T2->is( $actions->[1]{payload}{op}, 6, 'the next connection sends Resume' );
@@ -127,6 +140,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # Future Discord events must pass through without losing unknown fields.
         my $actions =
             $session->receive( { op => 0, s => 45, t => 'NEW_UNKNOWN_DISPATCH', d => { future_field => 'ok' } } );
 
@@ -143,6 +157,7 @@ T2->subtest(
     sub {
         my $session = ready_session();
 
+        # An explicit stop must discard the identity that automatic reconnect would retain.
         $session->stop;
 
         T2->is( $session->state, 'stopped', 'the session is stopped' );

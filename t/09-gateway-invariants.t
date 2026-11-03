@@ -25,6 +25,7 @@ sub ready {
 T2->subtest(
     'malformed packets leave resume state intact',
     sub {
+        # Vary one malformed protocol field at a time while starting from valid resume state.
         my @invalid_packets = (
             { name => 'undefined packet', packet => undef, error => qr/packet must be a hashref/ },
             { name => 'array packet', packet => [], error => qr/packet must be a hashref/ },
@@ -96,6 +97,8 @@ T2->subtest(
                 error => qr/requires a boolean/
             },
         );
+
+        # Each failure must leave the previous sequence, identity and readiness intact.
         for my $case (@invalid_packets) {
             T2->subtest(
                 $case->{name},
@@ -115,6 +118,7 @@ T2->subtest(
 T2->subtest(
     'invalid jitter cannot partially authenticate',
     sub {
+        # Exercise non-finite and out-of-range injected randomness before handshake mutation.
         my @invalid_jitter = (
             { name => 'negative value', value => -1 },
             { name => 'excluded upper bound', value => 1 },
@@ -144,12 +148,16 @@ T2->subtest(
     'deterministic heartbeat sequences and JSON booleans',
     sub {
         my $session = ready();
+
+        # Advance dispatch sequences and acknowledge every beat to isolate sequence tracking.
         for my $sequence ( 43 .. 48 ) {
             $session->receive( { op => 0, s => $sequence, t => 'FUTURE_EVENT', d => { new => $sequence } } );
             T2->is( $session->heartbeat_due->[0]{payload}{d}, $sequence, 'heartbeat uses latest dispatch' );
             $session->receive( { op => 11 } );
         }
         T2->ok( !$session->heartbeat_pending, 'ACK clears watchdog' );
+
+        # A decoded JSON false must invalidate the session just like a numeric false.
         my $actions = $session->receive( { op => 9, d => JSON::PP::false } );
         T2->ok( !$actions->[0]{resume} && !$session->can_resume, 'JSON false invalidates session' );
     }
@@ -185,7 +193,7 @@ T2->subtest(
                                         op => 10,
                                         d => { heartbeat_interval => $case->{value} },
                                     }
-                                )
+                                );
                             }
                         ),
                         qr/invalid heartbeat interval/,
@@ -194,6 +202,7 @@ T2->subtest(
                     T2->is( $session->state, 'awaiting_hello', 'handshake remains available' );
                     T2->is( $session->heartbeat_interval_ms, undef, 'no interval is installed' );
 
+                    # After rejecting bad input, the same session must still accept a valid HELLO.
                     my $actions = $session->receive( { op => 10, d => { heartbeat_interval => 1000 } } );
                     T2->is(
                         $actions->[0],
@@ -214,6 +223,7 @@ T2->subtest(
 T2->subtest(
     'shard payload and fatal session cleanup',
     sub {
+        # Shard identity belongs in Identify, while fatal closure must discard resume state.
         my $session = Discord::Client::Gateway::Session->new(
             token => 'FAKE',
             shard => [ 1, 2 ],

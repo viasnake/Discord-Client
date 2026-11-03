@@ -43,9 +43,15 @@ sub info {
     $load->on_ready(
         sub {
             return if $future->is_ready;
-            if ( $load->is_done ) { $future->done( $self->{info} ) }
-            elsif ( $load->is_failed ) { $future->fail( $load->failure ) }
-            else { $self->_fail( $future, 'Gateway discovery cancelled', 'transport' ) }
+            if ( $load->is_done ) {
+                $future->done( $self->{info} );
+            }
+            elsif ( $load->is_failed ) {
+                $future->fail( $load->failure );
+            }
+            else {
+                $self->_fail( $future, 'Gateway discovery cancelled', 'transport' );
+            }
         }
     );
     return $future;
@@ -69,33 +75,8 @@ sub _load {
             # Clear discovery ownership before notifying callbacks that may re-enter.
             delete @{$self}{qw(http load)};
             return if $result->is_ready;
-            if ( $self->{closed} ) {
-                $self->_fail( $result, 'Identify limiter is closed', 'shutdown' )
-            }
-            elsif ( $http->is_failed ) { $result->fail( $http->failure ) }
-            elsif ( $http->is_cancelled ) {
-                $self->_fail( $result, 'Gateway discovery cancelled', 'transport' )
-            }
-            else {
-                my ($info) = $http->result;
-                if ( !$self->_valid_info($info) ) {
-                    $self->_fail( $result, 'Invalid Gateway Bot metadata', 'protocol' );
-                }
-                else {
-                    # Keep the server's remaining budget; zero gives no future reset time.
-                    $self->{info} = $info;
-                    my $limit = $info->{session_start_limit};
-                    $self->{remaining} = $limit->{remaining};
-                    if ( $limit->{reset_after} > 0 ) {
-                        $self->{reset_at} = $self->{clock}->() + $limit->{reset_after} / 1000;
-                    }
-                    else {
-                        $self->{reset_at} = undef;
-                    }
-                    $self->{max_concurrency} = $limit->{max_concurrency};
-                    $result->done($info);
-                }
-            }
+            $self->_complete_discovery( $result, $http );
+
             if ( $result->is_failed ) {
 
                 # Fail queued requests together when no usable budget can be discovered.
@@ -108,6 +89,31 @@ sub _load {
         }
     );
     return $result;
+}
+
+sub _complete_discovery {
+    my ( $self, $result, $http ) = @_;
+
+    # Settle terminal failures before inspecting or installing any metadata.
+    return $self->_fail( $result, 'Identify limiter is closed', 'shutdown' ) if $self->{closed};
+    return $result->fail( $http->failure ) if $http->is_failed;
+    return $self->_fail( $result, 'Gateway discovery cancelled', 'transport' ) if $http->is_cancelled;
+
+    my ($info) = $http->result;
+    return $self->_fail( $result, 'Invalid Gateway Bot metadata', 'protocol' )
+        unless $self->_valid_info($info);
+
+    # Install the validated budget before notifying callers that may request permits.
+    # Zero reset_after supplies no future reset time.
+    my $limit = $info->{session_start_limit};
+    $self->{info} = $info;
+    $self->{remaining} = $limit->{remaining};
+    $self->{reset_at} =
+          $limit->{reset_after} > 0
+        ? $self->{clock}->() + $limit->{reset_after} / 1000
+        : undef;
+    $self->{max_concurrency} = $limit->{max_concurrency};
+    return $result->done($info);
 }
 
 sub _valid_info {
@@ -247,8 +253,12 @@ sub close {
 
     # Release timers and pending work without closing the caller-owned REST client.
     $self->{closed} = 1;
-    if ( my $timer = delete $self->{timer} ) { $timer->cancel unless $timer->is_ready }
-    if ( my $http = delete $self->{http} ) { $http->cancel unless $http->is_ready }
+    if ( my $timer = delete $self->{timer} ) {
+        $timer->cancel unless $timer->is_ready;
+    }
+    if ( my $http = delete $self->{http} ) {
+        $http->cancel unless $http->is_ready;
+    }
     my @jobs = @{ $self->{waiters} };
     $self->{waiters} = [];
     $self->_fail( $_->{future}, 'Identify limiter is closed', 'shutdown' )
@@ -263,7 +273,8 @@ sub commit {
 
     # Sends commit just before writing. Unused permits also commit on release
     # so abandoning a reservation cannot bypass the shared bucket cooldown.
-    return if $self->{committed}++;
+    return if $self->{committed};
+    $self->{committed} = 1;
     my $limiter = $self->{limiter};
     delete $limiter->{reserved}{ $self->{key} };
     $limiter->{bucket_until}{ $self->{key} } = $limiter->{clock}->() + 5;

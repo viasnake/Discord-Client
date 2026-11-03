@@ -18,8 +18,17 @@ use Discord::Client::Gateway::WebSocket;
 
 our $VERSION = '0.001';
 
+# Connection-local send limits; protocol traffic shares this window with application writes.
+use constant {
+    OUTGOING_WINDOW_SECONDS => 60,
+    MAX_SENDS_PER_WINDOW => 120,
+    MAX_PAYLOAD_BYTES => 4096,
+};
+
 sub new {
     my ( $class, %args ) = @_;
+
+    # Keep protocol state independent of the loop and the WebSocket transport.
     my $loop = $args{loop} // IO::Async::Loop->new;
     my $session = Discord::Client::Gateway::Session->new(
         token => $args{token},
@@ -58,6 +67,8 @@ sub new {
         on_error => $args{on_error},
         on_diagnostic => $args{on_diagnostic},
     }, $class;
+
+    # Validate resource bounds and hooks before attaching owned network resources.
     for my $field (qw(max_outgoing max_events max_handlers)) {
         croak "$field must be a positive integer"
             unless defined( $self->{$field} )
@@ -76,6 +87,8 @@ sub new {
         croak "$field must be a code reference" if defined( $args{$field} ) && ref( $args{$field} ) ne 'CODE';
     }
     croak 'websocket_options must be a hash reference' unless ref( $self->{websocket_options} ) eq 'HASH';
+
+    # Share discovery and Identify scheduling when a shard manager provides them.
     $self->{rest} = $args{rest} // Discord::Client::REST->new( token => $args{token}, loop => $loop );
     $self->{own_rest} = !$args{rest};
     $self->{identify_limiter} = $args{identify_limiter} // Discord::Client::Gateway::IdentifyLimiter->new(
@@ -97,18 +110,22 @@ sub identify_limiter { $_[0]->{identify_limiter} }
 
 sub stats {
     my ($self) = @_;
+
+    # Report queue sizes and timing without retaining or exposing payloads.
     return {
         %{ $self->{counters} },
         state => $self->{state},
         pending_events => scalar( @{ $self->{event_queue} } ),
         active_handlers => scalar( keys %{ $self->{handler_futures} } ),
-        pending_writes => scalar( @{ $self->{outgoing} } ) + ( $self->{write} ? 1 : 0 ),
+        pending_writes => scalar( @{ $self->{outgoing} } ) + ( $self->{active_write} ? 1 : 0 ),
         heartbeat_latency => $self->{heartbeat_latency}
     };
 }
 
 sub on {
     my ( $self, $event, $callback ) = @_;
+
+    # Validate the event before adding a callback to the delivery registry.
     croak 'event name and callback are required'
         unless defined($event)
         && !ref($event)
@@ -122,12 +139,15 @@ sub on {
 sub _on_dispatch {
     my ( $self, $callback ) = @_;
     croak 'dispatch observer must be a code reference' unless ref($callback) eq 'CODE';
+
     push @{ $self->{dispatch_observers} }, $callback;
     return $self;
 }
 
 sub connect {
     my ($self) = @_;
+
+    # Reuse an outstanding startup wait; a reconnect needs a fresh ready notification.
     return $self->_failed( 'Gateway is closed', 'shutdown' ) if $self->{closed};
     return $self->{loop}->new_future->done($self) if $self->{state} eq 'ready';
     return $self->{ready_future} if $self->{ready_future} && !$self->{ready_future}->is_ready;
@@ -135,10 +155,14 @@ sub connect {
     $self->{ready_future} = $ready;
     $ready->on_cancel( sub { $self->close } );
     return $ready if $self->{running};
+
+    # Discover the endpoint once before opening the first connection.
     $self->{running} = 1;
     $self->{state} = 'discovering';
     my $info = $self->{identify_limiter}->info;
     $self->{discovery} = $info;
+
+    # Discovery completion may arrive after the caller has closed the Gateway.
     $info->on_ready(
         sub {
             delete $self->{discovery};
@@ -151,7 +175,9 @@ sub connect {
                 my ( undef, $category ) = $info->failure;
                 $self->_fatal( 'Gateway discovery failed', $category // 'transport' );
             }
-            else { $self->_fatal( 'Gateway discovery cancelled', 'transport' ) }
+            else {
+                $self->_fatal( 'Gateway discovery cancelled', 'transport' );
+            }
         }
     );
     return $ready;
@@ -160,6 +186,8 @@ sub connect {
 sub _open {
     my ($self) = @_;
     return if $self->{closed};
+
+    # Tag callbacks so an old socket cannot mutate a newer connection.
     my $generation = ++$self->{generation};
     my $url = $self->{session}->can_resume ? $self->{session}->resume_gateway_url : $self->{gateway_info}{url};
     my $uri = URI->new($url);
@@ -175,6 +203,8 @@ sub _open {
     # Metadata and Resume URLs may omit a path; HTTP upgrades still need '/'.
     $uri->path('/') unless length( $uri->path );
     $uri->query_form( v => 10, encoding => 'json' );
+
+    # Transport callbacks do not own the Gateway; stale callbacks are ignored.
     my $weak = $self;
     weaken($weak);
     my %options = (
@@ -183,6 +213,8 @@ sub _open {
         on_text => sub { $weak->_receive( $_[0], $generation ) if $weak },
         on_close => sub { $weak->_closed( $_[0], $generation ) if $weak }
     );
+
+    # Validate injected adapters before using their asynchronous transport methods.
     my $websocket = eval {
               $self->{websocket_factory}
             ? $self->{websocket_factory}->(%options)
@@ -197,6 +229,8 @@ sub _open {
         $self->_fatal( 'Invalid Gateway transport', 'transport' );
         return;
     }
+
+    # Bound connection establishment and HELLO receipt with one handshake deadline.
     $self->{websocket} = $websocket;
     $self->{state} = 'connecting';
     $self->_timer(
@@ -211,6 +245,8 @@ sub _open {
         return;
     }
     $self->{connection_future} = $connect;
+
+    # Enter the protocol handshake only after WebSocket connection succeeds.
     $connect->on_ready(
         sub {
             return if $self->{closed} || $generation != $self->{generation};
@@ -220,7 +256,9 @@ sub _open {
                 $self->{state} = 'awaiting_hello';
                 $self->_diagnostic('connected');
             }
-            else { $self->_reconnect( 0, 'Gateway connection failed', 'transport' ) }
+            else {
+                $self->_reconnect( 0, 'Gateway connection failed', 'transport' );
+            }
         }
     );
 }
@@ -228,16 +266,22 @@ sub _open {
 sub _receive {
     my ( $self, $text, $generation ) = @_;
     return if $self->{closed} || $generation != $self->{generation};
+
+    # Decode and validate the packet before applying any transport actions.
     my $packet = eval { JSON::PP->new->decode($text) };
     my $actions = !$@ ? eval { $self->{session}->receive($packet) } : undef;
     if ( !$actions || $@ ) {
         $self->_reconnect( 0, 'Invalid Gateway packet', 'protocol' );
         return;
     }
+
+    # HELLO ends the connection deadline; Identify may wait on a shared permit.
     if ( $packet->{op} == 10 ) {
         $self->{state} = 'authenticating';
         $self->_cancel_timer('handshake');
     }
+
+    # Measure heartbeat acknowledgement latency independently of event callbacks.
     if ( $packet->{op} == 11 && defined( $self->{heartbeat_sent_at} ) ) {
         $self->{heartbeat_latency} = $self->{clock}->() - $self->{heartbeat_sent_at};
         $self->_diagnostic('heartbeat_ack');
@@ -247,6 +291,8 @@ sub _receive {
 
 sub _actions {
     my ( $self, $actions, $packet ) = @_;
+
+    # Execute protocol decisions in order, stopping if a callback closes the Gateway.
     for my $action (@$actions) {
         last if $self->{closed};
         if ( $action->{action} eq 'heartbeat_schedule' ) {
@@ -255,10 +301,16 @@ sub _actions {
         }
         elsif ( $action->{action} eq 'send' ) {
             my $payload = $action->{payload};
-            if ( $payload->{op} == 2 ) { $self->_identify($payload) }
-            else { $self->_protocol_send($payload) }
+            if ( $payload->{op} == 2 ) {
+                $self->_identify($payload);
+            }
+            else {
+                $self->_protocol_send($payload);
+            }
         }
         elsif ( $action->{action} eq 'event' ) {
+
+            # A ready session clears authentication timeout and begins the stability window.
             if ( $action->{name} eq 'READY' || $action->{name} eq 'RESUMED' ) {
                 $self->{state} = 'ready';
                 $self->_timer( stable => $self->{stable_after}, sub { $self->{attempts} = 0 } )
@@ -291,6 +343,8 @@ sub _actions {
 sub _heartbeat {
     my ($self) = @_;
     return if $self->{closed} || !$self->{websocket};
+
+    # A missed acknowledgement can replace the connection instead of sending a beat.
     my $generation = $self->{generation};
     $self->_actions( $self->{session}->heartbeat_due );
     return if $generation != $self->{generation} || $self->{closed};
@@ -299,6 +353,8 @@ sub _heartbeat {
 
 sub _identify {
     my ( $self, $payload ) = @_;
+
+    # Acquire a shared Identify permit without blocking heartbeat processing.
     my $generation = $self->{generation};
     my $grant = $self->{identify_limiter}->acquire( $self->{shard_id} );
     $self->{identify_future} = $grant;
@@ -322,53 +378,67 @@ sub _identify {
 
 sub _protocol_send {
     my ( $self, $payload, $permit ) = @_;
+
+    # Protocol writes have priority and reconnect if their delivery fails.
     my $generation = $self->{generation};
-    my $future = $self->_queue_send( $payload, 1, $permit );
+    my $future = $self->_queue_send( $payload, protocol => 1, permit => $permit );
     $future->on_ready(
         sub {
             return if $self->{closed} || $generation != $self->{generation};
-            if ( !$future->is_done ) { $self->_reconnect( 0, 'Gateway protocol write failed', 'transport' ) }
+            if ( !$future->is_done ) {
+                $self->_reconnect( 0, 'Gateway protocol write failed', 'transport' );
+            }
         }
     );
 }
 
 sub send {
     my ( $self, $op, $data ) = @_;
+
+    # Application sends cannot bypass the internal authentication or heartbeat paths.
     return $self->_failed( 'Gateway is closed', 'shutdown' ) if $self->{closed};
     return $self->_failed( 'Gateway is not ready', 'state' ) unless $self->{state} eq 'ready';
     return $self->_failed( 'Invalid Gateway opcode', 'request' )
         unless defined($op) && !ref($op) && $op =~ /\A\d+\z/ && $op != 1 && $op != 2 && $op != 6;
-    return $self->_queue_send( { op => 0 + $op, d => $data }, 0 );
+    return $self->_queue_send( { op => 0 + $op, d => $data } );
 }
 
 sub _queue_send {
-    my ( $self, $payload, $priority, $permit ) = @_;
+    my ( $self, $payload, %options ) = @_;
+    my $permit = $options{permit};
+    my $is_protocol = $options{protocol} // 0;
+
+    # Reject disconnected, oversized or excess writes before consuming a permit.
     my $future = $self->{loop}->new_future;
     unless ( $self->{websocket} ) {
         $permit->cancel if $permit;
         return $self->_fail( $future, 'Gateway is disconnected', 'state' );
     }
     my $text = eval { JSON::PP->new->encode($payload) };
-    if ( $@ || length( encode( 'UTF-8', $text ) ) > 4096 ) {
+    if ( $@ || length( encode( 'UTF-8', $text ) ) > MAX_PAYLOAD_BYTES ) {
         $permit->cancel if $permit;
         return $self->_fail( $future, 'Gateway payload is invalid or exceeds 4096 bytes', 'request' );
     }
-    if ( @{ $self->{outgoing} } + ( $self->{write} ? 1 : 0 ) >= $self->{max_outgoing} ) {
+    if ( @{ $self->{outgoing} } + ( $self->{active_write} ? 1 : 0 ) >= $self->{max_outgoing} ) {
         $permit->cancel if $permit;
         return $self->_fail( $future, 'Gateway write queue capacity exceeded', 'queue_full' );
     }
-    my $job = { future => $future, text => $text, permit => $permit, op => $payload->{op}, priority => $priority };
-    if ($priority) {
+
+    # Keep protocol traffic ahead of application writes within one serialized queue.
+    my $job = { future => $future, text => $text, permit => $permit, op => $payload->{op}, protocol => $is_protocol };
+    if ($is_protocol) {
         unshift @{ $self->{outgoing} }, $job;
     }
     else {
         push @{ $self->{outgoing} }, $job;
     }
+
+    # Queued writes can be removed; cancelling an active write makes delivery uncertain.
     $future->on_cancel(
         sub {
             @{ $self->{outgoing} } = grep { $_ != $job } @{ $self->{outgoing} };
             $permit->cancel if $permit;
-            if ( $self->{write} && $self->{write} == $job ) {
+            if ( $self->{active_write} && $self->{active_write} == $job ) {
                 $self->_reconnect( 0, 'Active Gateway write cancelled', 'transport' );
             }
         }
@@ -379,15 +449,17 @@ sub _queue_send {
 
 sub _drain_writes {
     my ($self) = @_;
-    return if $self->{write} || $self->{draining_writes} || !$self->{websocket} || $self->{closed};
+    return if $self->{active_write} || $self->{draining_writes} || !$self->{websocket} || $self->{closed};
+
+    # Synchronous transport completion must not recursively drain the same queue.
     local $self->{draining_writes} = 1;
-    while ( @{ $self->{outgoing} } && $self->{websocket} && !$self->{write} && !$self->{closed} ) {
+    while ( @{ $self->{outgoing} } && $self->{websocket} && !$self->{active_write} && !$self->{closed} ) {
         my $now = $self->{clock}->();
-        @{ $self->{send_times} } = grep { $_ > $now - 60 } @{ $self->{send_times} };
-        my $limit = $self->_outgoing_limit( $self->{outgoing}[0]{priority} );
+        @{ $self->{send_times} } = grep { $_ > $now - OUTGOING_WINDOW_SECONDS } @{ $self->{send_times} };
+        my $limit = $self->_outgoing_limit( $self->{outgoing}[0]{protocol} );
         if ( @{ $self->{send_times} } >= $limit ) {
             $self->_timer(
-                outbound => $self->{send_times}[0] + 60 - $now,
+                outbound => $self->{send_times}[0] + OUTGOING_WINDOW_SECONDS - $now,
                 sub { $self->_drain_writes }
             );
             last;
@@ -399,19 +471,27 @@ sub _drain_writes {
 }
 
 sub _outgoing_limit {
-    my ( $self, $priority ) = @_;
-    return 120 if $priority;
+    my ( $self, $is_protocol ) = @_;
+    return MAX_SENDS_PER_WINDOW if $is_protocol;
 
-    # The quota includes protocol traffic. Reserve capacity for expected
-    # heartbeats and authentication when application writes are busy.
-    my $reserve = $self->{heartbeat_interval} ? int( 60 / $self->{heartbeat_interval} ) + 3 : 4;
-    $reserve = 119 if $reserve > 119;
-    return 120 - $reserve;
+    # Application traffic leaves room for scheduled heartbeats and additional protocol writes.
+    # The three extra slots are local safety headroom; they do not increase the server quota.
+    my $reserved_sends = 4;
+    if ( $self->{heartbeat_interval} ) {
+        my $expected_heartbeats = int( OUTGOING_WINDOW_SECONDS / $self->{heartbeat_interval} );
+        $reserved_sends = $expected_heartbeats + 3;
+    }
+
+    # Even very short heartbeat intervals leave one slot for application traffic.
+    $reserved_sends = MAX_SENDS_PER_WINDOW - 1 if $reserved_sends >= MAX_SENDS_PER_WINDOW;
+    return MAX_SENDS_PER_WINDOW - $reserved_sends;
 }
 
 sub _start_write {
     my ( $self, $job ) = @_;
-    $self->{write} = $job;
+
+    # Commit Identify immediately before sending, then account for connection quota.
+    $self->{active_write} = $job;
     my $generation = $self->{generation};
     $job->{permit}->commit if $job->{permit};
     return 0 if $self->{closed} || $generation != $self->{generation};
@@ -422,13 +502,17 @@ sub _start_write {
     return 0 if $self->{closed} || $generation != $self->{generation};
 
     push @{ $self->{send_times} }, $self->{clock}->();
-    my $write = eval { $self->{websocket}->send( $job->{text} ) };
-    unless ( blessed($write) && $write->isa('Future') ) {
-        delete $self->{write};
+
+    # Translate adapter exceptions into a failed write and a connection reset.
+    my $write_future = eval { $self->{websocket}->send( $job->{text} ) };
+    unless ( blessed($write_future) && $write_future->isa('Future') ) {
+        delete $self->{active_write};
         $self->_fail( $job->{future}, 'Gateway write failed', 'transport' );
         $self->_reconnect( 0, 'Gateway write failed', 'transport' );
         return 0;
     }
+
+    # Authentication timeout starts at send time, after any Identify scheduling delay.
     if ( $job->{op} =~ /\A(?:2|6)\z/ && $self->{state} ne 'ready' && !$self->{closed} ) {
         $self->_timer(
             handshake => $self->{connect_timeout},
@@ -437,45 +521,55 @@ sub _start_write {
             }
         );
     }
-    $job->{io} = $write;
-    $write->on_ready( sub { $self->_complete_write( $job, $write, $generation ) } );
+    $job->{write_future} = $write_future;
+    $write_future->on_ready( sub { $self->_complete_write( $job, $write_future, $generation ) } );
     return 1;
 }
 
 sub _complete_write {
-    my ( $self, $job, $write, $generation ) = @_;
+    my ( $self, $job, $write_future, $generation ) = @_;
     return if $generation != $self->{generation} || $self->{closed};
-    delete $self->{write};
+
+    # Release the active slot before notifying callers that can enqueue more writes.
+    delete $self->{active_write};
     if ( !$job->{future}->is_ready ) {
-        if ( $write->is_done ) {
+        if ( $write_future->is_done ) {
             $job->{future}->done;
         }
         else {
             $self->_fail( $job->{future}, 'Gateway write failed', 'transport' );
         }
     }
-    $self->_reconnect( 0, 'Gateway write failed', 'transport' ) unless $write->is_done;
+    $self->_reconnect( 0, 'Gateway write failed', 'transport' ) unless $write_future->is_done;
     $self->_drain_writes;
 }
 
 sub _closed {
     my ( $self, $code, $generation ) = @_;
     return if $self->{closed} || $generation != $self->{generation};
+
+    # Fatal Discord close codes terminate the lifetime; recoverable closes reconnect.
     my $actions = $self->{session}->closed($code);
     if ( @$actions && $actions->[0]{action} eq 'fatal' ) {
         $self->_fatal( 'Discord rejected the Gateway session', 'gateway_close', close_code => $code );
     }
-    else { $self->_reconnect( 0, 'Gateway connection closed', 'transport' ) }
+    else {
+        $self->_reconnect( 0, 'Gateway connection closed', 'transport' );
+    }
 }
 
 sub _reconnect {
     my ( $self, $minimum, $message, $category, $immediate ) = @_;
     return if $self->{closed} || $self->{state} eq 'reconnecting';
+
+    # Notify the caller before teardown, allowing the error hook to request shutdown.
     $self->_report( $message, $category );
     return if $self->{closed};
     $self->_teardown;
     $self->{session}->closed(1006);
     $self->{state} = 'reconnecting';
+
+    # Bound exponential backoff and jitter; explicit server reconnects may be immediate.
     my $attempt = $self->{attempts}++;
     $attempt = 16 if $attempt > 16;
     my $base = $self->{backoff_base} * ( 2**$attempt );
@@ -501,10 +595,15 @@ sub _dispatch {
 
     # Cache updates and interaction admission must survive application overload.
     for my $observer ( @{ $self->{dispatch_observers} } ) {
-        my $ok = eval { $observer->( $event, $data, $self, $packet, $received_at ); 1 };
+        my $ok = eval {
+            $observer->( $event, $data, $self, $packet, $received_at );
+            1;
+        };
         $self->_report( 'Gateway dispatch observer failed', 'handler', event => $event ) unless $ok;
         return if $self->{closed};
     }
+
+    # Queue each application listener separately after SDK observers have run.
     my @jobs;
     for my $callback ( @{ $self->{handlers}{$event} // [] } ) {
         push @jobs,
@@ -522,6 +621,8 @@ sub _dispatch {
                 event => $event,
             };
     }
+
+    # Drop the whole application event on overflow and report once per saturated queue.
     if ( @{ $self->{event_queue} } + @jobs > $self->{max_events} ) {
         ++$self->{counters}{dropped_events};
         $self->{counters}{dropped_callbacks} += @jobs;
@@ -538,6 +639,8 @@ sub _dispatch {
 sub _schedule_handlers {
     my ($self) = @_;
     return if $self->{handler_scheduled} || $self->{closed} || !@{ $self->{event_queue} };
+
+    # Defer application callbacks so packet processing can finish first.
     $self->{handler_scheduled} = 1;
     $self->{defer}->(
         sub {
@@ -550,6 +653,8 @@ sub _schedule_handlers {
 sub _drain_handlers {
     my ($self) = @_;
     return if $self->{closed} || $self->{draining_handlers};
+
+    # Admit callbacks up to the pending-Future limit without recursive draining.
     local $self->{draining_handlers} = 1;
     while ( @{ $self->{event_queue} } && keys( %{ $self->{handler_futures} } ) < $self->{max_handlers} ) {
         my $job = shift @{ $self->{event_queue} };
@@ -558,7 +663,19 @@ sub _drain_handlers {
             $self->_report( 'Gateway event handler failed', 'handler', event => $job->{event} );
             next;
         }
-        last if $self->{closed};
+        if ( $self->{closed} ) {
+
+            # Work returned by a closing handler has not yet entered our registry.
+            # Preserve close itself so its transport handshake can finish.
+            $result->cancel
+                if blessed($result)
+                && $result->isa('Future')
+                && !$result->is_ready
+                && ( !$self->{close_future} || $result != $self->{close_future} );
+            last;
+        }
+
+        # Keep handler work alive until settled and resume queued callbacks afterward.
         if ( blessed($result) && $result->isa('Future') ) {
             my $id = refaddr($job);
             $self->{handler_futures}{$id} = $result;
@@ -578,6 +695,8 @@ sub _drain_handlers {
 
 sub _timer {
     my ( $self, $name, $after, $callback ) = @_;
+
+    # Only one timer per purpose may act on the current connection generation.
     $self->_cancel_timer($name);
     my $generation = $self->{generation};
     my $timer = $self->{delay}->($after);
@@ -592,25 +711,37 @@ sub _timer {
 
 sub _cancel_timer {
     my ( $self, $name ) = @_;
-    if ( my $timer = delete $self->{timers}{$name} ) { $timer->cancel unless $timer->is_ready }
+
+    # Detach the timer before cancellation can invoke callbacks that re-enter the driver.
+    if ( my $timer = delete $self->{timers}{$name} ) {
+        $timer->cancel unless $timer->is_ready;
+    }
 }
 
 sub _teardown {
     my ($self) = @_;
+
+    # Invalidate old callbacks before cancelling timers and in-flight operations.
     ++$self->{generation};
     $self->_cancel_timer($_) for keys %{ $self->{timers} };
     for my $name (qw(connection_future identify_future discovery)) {
-        if ( my $future = delete $self->{$name} ) { $future->cancel unless $future->is_ready }
+        if ( my $future = delete $self->{$name} ) {
+            $future->cancel unless $future->is_ready;
+        }
     }
+
+    # Detach queued writes before failing them; completion hooks may re-enter the driver.
     my @writes = @{ $self->{outgoing} };
     $self->{outgoing} = [];
-    push @writes, delete( $self->{write} ) if $self->{write};
+    push @writes, delete( $self->{active_write} ) if $self->{active_write};
     for my $job (@writes) {
         $job->{permit}->cancel if $job->{permit};
-        $job->{io}->cancel if $job->{io} && !$job->{io}->is_ready;
+        $job->{write_future}->cancel if $job->{write_future} && !$job->{write_future}->is_ready;
         $self->_fail( $job->{future}, 'Gateway disconnected before write completed', 'transport' )
             unless $job->{future}->is_ready;
     }
+
+    # Connection-local timing and quota must not leak into the replacement socket.
     delete @{$self}{qw(heartbeat_interval heartbeat_sent_at)};
     $self->{send_times} = [];
     my $websocket = delete $self->{websocket};
@@ -630,27 +761,41 @@ sub _failed {
 
 sub _report {
     my ( $self, $message, $category, %fields ) = @_;
+
+    # Surface structured errors without forwarding raw exceptions or protocol payloads.
     my $error = Discord::Client::Error->new( message => $message, category => $category, %fields );
     ++$self->{counters}{errors};
     if ( $self->{on_error} ) {
-        my $ok = eval { $self->{on_error}->( $error, $self ); 1 };
+        my $ok = eval {
+            $self->{on_error}->( $error, $self );
+            1;
+        };
         warn "Gateway error handler failed\n" unless $ok;
     }
-    else { warn "$message\n" }
+    else {
+        warn "$message\n";
+    }
     return $error;
 }
 
 sub _diagnostic {
     my ( $self, $type, %fields ) = @_;
+
+    # Diagnostics are optional observations and cannot interrupt protocol processing.
     ++$self->{counters}{$type};
     return unless $self->{on_diagnostic};
-    my $ok = eval { $self->{on_diagnostic}->( { type => $type, %fields, state => $self->{state} } ); 1 };
+    my $ok = eval {
+        $self->{on_diagnostic}->( { type => $type, %fields, state => $self->{state} } );
+        1;
+    };
     warn "Gateway diagnostic handler failed\n" unless $ok;
 }
 
 sub _fatal {
     my ( $self, $message, $category, %fields ) = @_;
     return if $self->{closed};
+
+    # Fail startup and lifetime before closing so fatal failures remain observable.
     my $error = $self->_report( $message, $category, %fields );
     $self->{fatal_error} = $error;
     $self->_fail( $self->{ready_future}, $message, $category, %fields )
@@ -662,22 +807,32 @@ sub _fatal {
 sub close {
     my ($self) = @_;
     return $self->{close_future} if $self->{close_future};
+
+    # Publish the shutdown Future before cancelling anything that can re-enter close.
     my $result = $self->{loop}->new_future;
     $self->{close_future} = $result;
     $self->{closed} = 1;
     $self->{state} = 'closed';
+
+    # Detach the live socket so teardown cannot abort the graceful close handshake.
     my $websocket = delete $self->{websocket};
     $self->_teardown;
     $self->{session}->stop;
     $self->_fail( $self->{ready_future}, 'Gateway closed before READY', 'shutdown' )
         if $self->{ready_future} && !$self->{ready_future}->is_ready;
+
+    # Drop queued notifications and cancel pending handlers before releasing owned resources.
     $self->{event_queue} = [];
     $self->{dispatch_observers} = [];
     my @handlers = values %{ $self->{handler_futures} };
     $self->{handler_futures} = {};
-    for my $future (@handlers) { $future->cancel unless $future->is_ready }
+    for my $future (@handlers) {
+        $future->cancel unless $future->is_ready;
+    }
     $self->{identify_limiter}->close if $self->{own_limiter};
     $self->{rest}->close if $self->{own_rest};
+
+    # Await transport shutdown, converting adapter exceptions into a sanitized failure.
     my $closing = $websocket ? eval { $websocket->close(1000) } : $self->{loop}->new_future->done;
 
     if ( !blessed($closing) || !$closing->isa('Future') ) {
@@ -693,6 +848,8 @@ sub close {
             $closing->is_done ? $result->done : $self->_fail( $result, 'Gateway shutdown failed', 'transport' );
         }
     );
+
+    # Explicit shutdown cancellation aborts the socket and ends the lifetime wait.
     $result->on_cancel(
         sub {
             $closing->cancel unless $closing->is_ready;

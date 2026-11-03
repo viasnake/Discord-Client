@@ -14,6 +14,8 @@ sub setup {
     my $rig = rig( loop => $rest->loop, %gateway_options );
     my $clock = $rig->{clock};
     my @errors;
+
+    # Use the Gateway receipt clock for interaction deadlines as well as protocol timing.
     my $bot = Discord::Client->new(
         token => 'FAKE_GATEWAY_TOKEN',
         loop => $rest->loop,
@@ -69,11 +71,15 @@ T2->subtest(
         );
         $bot->component( ping_button => sub { $_[0]->reply( 'Button pressed', ephemeral => 1 ) } );
         T2->is( $http->count, 0, 'construct/declaration performs no REST' );
+
+        # Startup opens the Gateway without deploying command declarations.
         my $started = $bot->start;
         my $websocket = ready_socket( $rig, interval => 60_000 );
         $rig->{clock}->run_deferred;
         T2->ok( $started->is_done, 'facade starts Gateway' );
         T2->is( $http->count, 0, 'startup never synchronizes commands' );
+
+        # Receive the slash command through normal Gateway routing and acknowledge its reply.
         $websocket->emit( { op => 0, s => 43, t => 'INTERACTION_CREATE', d => payload(100) } );
         $rig->{clock}->run_deferred;
         T2->is( $calls, 1, 'slash handler called' );
@@ -96,6 +102,8 @@ T2->subtest(
         my $button = JSON::PP->new->utf8->decode( $http->call->{request}->content );
         T2->is( $button->{data}{flags}, 64, 'component ephemeral response' );
         $http->respond( response( 204, undef ) );
+
+        # Replay the original interaction after both replies to check duplicate protection.
         $websocket->emit( { op => 0, s => 45, t => 'INTERACTION_CREATE', d => payload(100) } );
         $rig->{clock}->run_deferred;
         T2->is( $calls, 1, 'Resume replay cannot invoke or reply twice' );

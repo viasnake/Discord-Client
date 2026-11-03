@@ -16,6 +16,8 @@ sub manager {
         bless { calls => [], responses => [ $args{info} // gateway_info( max_concurrency => 2 ) ] },
         'TestDiscordGateway::REST';
     my @sockets;
+
+    # Share one clock and discovery response while recording each child socket separately.
     my %gateway_options = (
         token => 'FAKE_SHARD_TOKEN',
         rest => $rest,
@@ -40,6 +42,8 @@ sub manager {
 sub hello {
     my ($websocket) = @_;
     $websocket->open;
+
+    # Acknowledge heartbeats so advancing the Identify clock does not create unrelated reconnects.
     $websocket->{on_send} = sub { $websocket->emit( { op => 11 } ) if $_[0]{op} == 1 };
     $websocket->emit( { op => 10, d => { heartbeat_interval => 10000 } } );
 }
@@ -57,7 +61,7 @@ sub ready {
 }
 
 sub identifies {
-    [ map { $_->{d}{shard} } grep { $_->{op} == 2 } @{ $_[0]{frames} } ]
+    [ map { $_->{d}{shard} } grep { $_->{op} == 2 } @{ $_[0]{frames} } ];
 }
 
 T2->subtest(
@@ -67,12 +71,16 @@ T2->subtest(
         T2->is( scalar( @{ $rest->{calls} } ), 0, 'constructor performs no discovery' );
         my $start = $manager->connect;
         T2->is( scalar( @{ $rest->{calls} } ), 1, 'single discovery shared by all children' );
+
+        # Different Identify buckets may start together; the third shard shares bucket zero.
         hello($_) for @$sockets;
         T2->is( identifies( $sockets->[0] ), [ [ 0, 3 ] ], 'shard zero identified' );
         T2->is( identifies( $sockets->[1] ), [ [ 1, 3 ] ], 'different bucket identified concurrently' );
         T2->is( identifies( $sockets->[2] ), [], 'same bucket waits' );
         ready( $sockets->[$_], $_ ) for 0, 1;
         T2->ok( !$start->is_ready, 'readiness requires every shard' );
+
+        # Cross the five-second boundary before making the last shard ready.
         $clock->advance(4.99);
         T2->is( identifies( $sockets->[2] ), [], 'cooldown enforced' );
         $clock->advance(0.01);
@@ -80,6 +88,8 @@ T2->subtest(
         ready( $sockets->[2], 2 );
         $clock->run_deferred;
         T2->ok( $start->is_done, 'all READY resolves startup' );
+
+        # Guild routing must retain the full precision of Discord snowflakes.
         T2->is( $manager->shard_for_guild('4194304'), 1, 'snowflake shard routing' );
         T2->is( $manager->shard_for_guild('18446744073709551615'), 0, 'uint64 routing retains precision' );
         T2->like(
@@ -94,6 +104,8 @@ T2->subtest(
         T2->is( $sockets->[1]{frames}[-1]{op}, 3, 'guild send targets correct shard' );
         $manager->broadcast( 3, { status => 'idle' } )->get;
         T2->is( $_->{frames}[-1]{d}{status}, 'idle', 'broadcast sent' ) for @$sockets;
+
+        # A reconnecting child makes the aggregate unavailable until its session resumes.
         $sockets->[0]->emit( { op => 7 } );
         T2->is( $manager->state, 'reconnecting', 'manager reflects a reconnecting child' );
         my $again = $manager->connect;
@@ -120,6 +132,8 @@ T2->subtest(
         T2->ok( $start->is_failed && $manager->completion->is_failed, 'fatal shard fails startup and lifetime' );
         T2->is( $manager->state, 'closed', 'fatal failure closes all shards' );
         T2->is( $clock->timer_count, 0, 'fatal shutdown removes timers' );
+
+        # Cancellation during discovery must stop the shared request before creating children.
         my $discovery = Future->new;
         ( $manager, $clock, $rest, $sockets ) = manager( info => $discovery );
         $start = $manager->connect;
@@ -143,7 +157,12 @@ T2->subtest(
             on_error => sub { push @errors, $_[0] }
         );
         my @seen;
-        $manager->on( TEST => sub { push @seen, 'first'; die 'FAKE_SHARD_TOKEN handler secret' } );
+        $manager->on(
+            TEST => sub {
+                push @seen, 'first';
+                die 'FAKE_SHARD_TOKEN handler secret';
+            }
+        );
         $manager->on( TEST => sub { push @seen, 'second' } );
         $manager->connect;
         hello( $sockets->[0] );
@@ -172,7 +191,7 @@ T2->subtest(
         T2->like(
             T2->dies(
                 sub {
-                    $manager->on( '' => sub { } )
+                    $manager->on( '' => sub { } );
                 }
             ),
             qr/Event and callback required/,
@@ -186,7 +205,7 @@ T2->subtest(
         T2->like(
             T2->dies(
                 sub {
-                    $manager->on( '' => sub { } )
+                    $manager->on( '' => sub { } );
                 }
             ),
             qr/Event and callback required/,
@@ -208,8 +227,18 @@ T2->subtest(
         my ( $manager, $clock, $rest, $sockets ) = manager( shards => 1, max_handlers => 1 );
         my ( $first, $second ) = ( Future->new, Future->new );
         my @seen;
-        $manager->on( TEST => sub { push @seen, 'first'; return $first } );
-        $manager->on( TEST => sub { push @seen, 'second'; return $second } );
+        $manager->on(
+            TEST => sub {
+                push @seen, 'first';
+                return $first;
+            }
+        );
+        $manager->on(
+            TEST => sub {
+                push @seen, 'second';
+                return $second;
+            }
+        );
         $manager->connect;
         hello( $sockets->[0] );
         ready( $sockets->[0], 0 );

@@ -17,6 +17,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Bound shard creation before constructing shared discovery resources.
     my $count = $args{shards} // 'auto';
     croak 'shards must be auto or a positive integer'
         unless !ref($count) && ( $count eq 'auto' || $count =~ /\A[1-9]\d*\z/ );
@@ -34,6 +36,8 @@ sub new {
         max_shards => $max,
         completion => $loop->new_future
     }, $class;
+
+    # All children share one REST client and one Identify budget.
     $self->{rest} = $args{rest} // Discord::Client::REST->new( token => $args{token}, loop => $loop );
     $self->{own_rest} = !$args{rest};
     $self->{limiter} = Discord::Client::Gateway::IdentifyLimiter->new(
@@ -52,6 +56,8 @@ sub completion { $_[0]->{completion} }
 
 sub state {
     my ($self) = @_;
+
+    # Readiness reflects every live child, including temporary reconnects.
     return 'closed' if $self->{closed};
     return 'ready' if keys( %{ $self->{shards} } ) && !grep { $_->state ne 'ready' } values %{ $self->{shards} };
     return $self->{state} eq 'ready' ? 'reconnecting' : $self->{state};
@@ -64,6 +70,8 @@ sub on {
         && !ref($event)
         && length($event)
         && ref($callback) eq 'CODE';
+
+    # Remember listeners for future children and attach them to existing ones.
     push @{ $self->{handlers}{$event} }, $callback;
     $_->on( $event => $callback ) for values %{ $self->{shards} };
     return $self;
@@ -73,6 +81,8 @@ sub on {
 sub _on_dispatch {
     my ( $self, $callback ) = @_;
     croak 'dispatch observer must be a code reference' unless ref($callback) eq 'CODE';
+
+    # Register SDK state observers for both existing and future children.
     push @{ $self->{dispatch_observers} }, $callback;
     $_->_on_dispatch($callback) for values %{ $self->{shards} };
     return $self;
@@ -86,12 +96,16 @@ sub _failed {
 
 sub connect {
     my ($self) = @_;
+
+    # Coalesce startup waits and reject attempts to restart a closed manager.
     return $self->_failed( 'Shard manager is closed', 'shutdown' ) if $self->{closed};
     return $self->{loop}->new_future->done($self) if $self->state eq 'ready';
     return $self->{ready} if $self->{ready} && !$self->{ready}->is_ready;
     my $future = $self->{loop}->new_future;
     $self->{ready} = $future;
     $future->on_cancel( sub { $self->close } );
+
+    # During recovery, observe each child until the full group becomes ready again.
     if ( $self->{running} ) {
         my $weak = $self;
         weaken($weak);
@@ -99,6 +113,8 @@ sub connect {
             for values %{ $self->{shards} };
         return $future;
     }
+
+    # Discover metadata before choosing the automatic shard count.
     $self->{running} = 1;
     $self->{state} = 'discovering';
     my $info = $self->{limiter}->info;
@@ -121,6 +137,8 @@ sub connect {
 
 sub _start_shards {
     my ( $self, $metadata ) = @_;
+
+    # Validate the server recommendation against the configured process capacity.
     my $count = $self->{count} eq 'auto' ? $metadata->{shards} : $self->{count};
     unless ( defined($count) && !ref($count) && $count =~ /\A[1-9]\d*\z/ && $count <= $self->{max_shards} ) {
         $self->_fatal( $self->_failed( 'Shard count is invalid or exceeds client capacity', 'request' ) );
@@ -128,6 +146,8 @@ sub _start_shards {
     }
     $self->{total} = 0 + $count;
     $self->{state} = 'connecting';
+
+    # Construct children with explicit shard identities and a shared Identify limiter.
     for my $id ( 0 .. $count - 1 ) {
         my $gateway = eval {
             Discord::Client::Gateway->new(
@@ -150,10 +170,14 @@ sub _start_shards {
 
 sub _attach_shard {
     my ( $self, $gateway ) = @_;
+
+    # Install state observers and application handlers before opening the child.
     $gateway->_on_dispatch($_) for @{ $self->{dispatch_observers} };
     for my $event ( keys %{ $self->{handlers} } ) {
         $gateway->on( $event => $_ ) for @{ $self->{handlers}{$event} };
     }
+
+    # Child failures stop the group without making children own their manager.
     my $weak = $self;
     weaken($weak);
     $gateway->completion->on_fail(
@@ -171,6 +195,8 @@ sub _attach_shard {
 
 sub _maybe_ready {
     my ($self) = @_;
+
+    # Complete startup only when the expected number of children are all ready.
     return
         unless keys( %{ $self->{shards} } ) == ( $self->{total} // -1 )
         && !grep { $_->state ne 'ready' } values %{ $self->{shards} };
@@ -181,6 +207,8 @@ sub _maybe_ready {
 
 sub _fatal {
     my ( $self, $failure ) = @_;
+
+    # Publish the failure before shutdown can settle outstanding lifetime observers.
     $self->{ready}->fail( $failure->failure ) if $self->{ready} && !$self->{ready}->is_ready;
     $self->{completion}->fail( $failure->failure ) unless $self->{completion}->is_ready;
     $self->close;
@@ -190,6 +218,8 @@ sub shard_for_guild {
     my ( $self, $guild_id ) = @_;
     croak 'Shard count is not discovered' unless $self->{total};
     croak 'Invalid guild ID' unless defined($guild_id) && !ref($guild_id) && $guild_id =~ /\A\d{1,20}\z/;
+
+    # Use integer arithmetic so routing also works on Perls with smaller native integers.
     my $id = Math::BigInt->new($guild_id);
     croak 'Guild ID exceeds uint64' if $id->bcmp('18446744073709551615') > 0;
     return $id->brsft(22)->bmod( $self->{total} )->numify;
@@ -197,6 +227,8 @@ sub shard_for_guild {
 
 sub send {
     my ( $self, $opcode, $data, %args ) = @_;
+
+    # Resolve the target explicitly; a guild ID takes precedence over a shard ID.
     my ( $id, $error );
     if ( exists $args{guild_id} ) {
         $id = eval { $self->shard_for_guild( $args{guild_id} ) };
@@ -229,6 +261,8 @@ sub stats {
 sub close {
     my ($self) = @_;
     return $self->{closing} if $self->{closing};
+
+    # Stop group admission before closing children and the shared scheduler.
     $self->{closed} = 1;
     $self->{state} = 'closed';
     $self->{ready}->fail( $self->_failed( 'Shard manager closed', 'shutdown' )->failure )
@@ -238,6 +272,8 @@ sub close {
     push @closing, $self->{rest}->close if $self->{own_rest};
     $self->{handlers} = {};
     $self->{dispatch_observers} = [];
+
+    # The manager lifetime ends only after all shutdown Futures settle.
     my $future = $self->{closing} = Future->needs_all(@closing);
     $future->on_ready( sub { $self->{completion}->done unless $self->{completion}->is_ready } );
     return $future;

@@ -29,6 +29,8 @@ sub gateway_info {
 
 sub rig {
     my (%args) = @_;
+
+    # Use one controlled clock for protocol timers and deferred application delivery.
     my $clock = bless { now => 0, timers => [], deferred => [] }, 'TestDiscordGateway::Clock';
     my $rest = $args{rest} // bless { calls => [], responses => [ $args{info} // gateway_info() ] },
         'TestDiscordGateway::REST';
@@ -58,6 +60,8 @@ sub rig {
 sub ready_socket {
     my ( $rig, %args ) = @_;
     my $websocket = $rig->{sockets}[-1];
+
+    # Complete the handshake through received frames rather than changing session internals.
     $websocket->open;
     $websocket->emit( { op => 10, d => { heartbeat_interval => $args{interval} // 1000 } } );
     $websocket->emit(
@@ -80,6 +84,8 @@ our @ISA = ('TestDiscordREST::Clock');
 
 sub run_deferred {
     my ($self) = @_;
+
+    # Drain callbacks added by earlier callbacks, but fail instead of looping forever.
     my $count = 0;
     while ( @{ $self->{deferred} } ) {
         die 'Deferred callback loop' if ++$count > 10000;
@@ -93,12 +99,21 @@ sub request {
     my ( $self, $method, $path ) = @_;
     push @{ $self->{calls} }, [ $method, $path ];
     my $response = shift @{ $self->{responses} };
+
+    # Permit a pending discovery Future as well as immediate metadata responses.
     return $response if Scalar::Util::blessed($response) && $response->isa('Future');
     return Future->done( $response // TestDiscordGateway::gateway_info() );
 }
 
 package TestDiscordGateway::WebSocket;
-sub connect { $_[0]->{url} = $_[1]; return $_[0]->{connect} = Future->new }
+
+sub connect {
+    my ( $self, $url ) = @_;
+
+    # Keep the handshake pending until the test opens or fails this socket.
+    $self->{url} = $url;
+    return $self->{connect} = Future->new;
+}
 sub open { $_[0]->{connect}->done( $_[0] ) }
 sub emit { $_[0]->text( JSON::PP->new->encode( $_[1] ) ) }
 sub text { $_[0]->{options}{on_text}->( $_[1] ) }
@@ -107,6 +122,8 @@ sub remote_close { $_[0]->{options}{on_close}->( $_[1] ) }
 sub send {
     my ( $self, $text ) = @_;
     push @{ $self->{frames} }, JSON::PP->new->decode($text);
+
+    # Track concurrent writes and optionally hold them pending to simulate backpressure.
     my $future = Future->new;
     push @{ $self->{writes} }, $future;
     ++$self->{active};
@@ -116,7 +133,18 @@ sub send {
     $self->{on_send}->( $self->{frames}[-1] ) if $self->{on_send};
     return $future;
 }
-sub abort { $_[0]->{aborted}++; return Future->done }
-sub close { $_[0]->{close_code} = $_[1]; return $_[0]->{close_future} // Future->done }
+
+sub abort {
+    $_[0]->{aborted}++;
+    return Future->done;
+}
+
+sub close {
+    my ( $self, $code ) = @_;
+
+    # Most scenarios close immediately; lifecycle tests can hold the handshake pending.
+    $self->{close_code} = $code;
+    return $self->{close_future} // Future->done;
+}
 
 1;

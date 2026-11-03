@@ -14,6 +14,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Validate bounded work and replay settings before accepting any payloads.
     croak 'A command registry is required' unless $args{commands};
     for my $key (qw(max_pending max_seen seen_ttl)) {
         croak "$key must be a positive integer"
@@ -23,6 +25,8 @@ sub new {
     for my $key (qw(clock delay on_error)) {
         croak "$key must be a code reference" if exists( $args{$key} ) && ref( $args{$key} ) ne 'CODE';
     }
+
+    # Keep active work separate from retained IDs used to suppress duplicate effects.
     return bless {
         loop => $args{loop} // IO::Async::Loop->new,
         commands => $args{commands},
@@ -52,12 +56,19 @@ sub _failed {
 
 sub _report {
     my ( $self, $error, $context ) = @_;
+
+    # Application error hooks receive sanitized failures and cannot break dispatch.
     ++$self->{counters}{errors};
     if ( $self->{on_error} ) {
-        my $ok = eval { $self->{on_error}->( $error, $context ); 1 };
+        my $ok = eval {
+            $self->{on_error}->( $error, $context );
+            1;
+        };
         warn "Interaction error handler failed\n" unless $ok;
     }
-    else { warn $error->message . "\n" }
+    else {
+        warn $error->message . "\n";
+    }
 }
 
 sub handle {
@@ -76,8 +87,12 @@ sub handle {
         ++$self->{counters}{duplicates};
         return $args{acknowledgement_only} ? $self->{seen}{$id}{ack} : $self->{seen}{$id}{result};
     }
+
+    # Reject overload before constructing a context or invoking application code.
     return $self->_failed( 'Interaction work capacity exceeded', 'queue_full' )
         if keys( %{ $self->{jobs} } ) >= $self->{max_pending} || keys( %{ $self->{seen} } ) >= $self->{max_seen};
+
+    # Use the same monotonic clock for receipt time, deadlines and replay retention.
     my %context_options = (
         payload => $payload,
         loop => $self->{loop},
@@ -94,13 +109,17 @@ sub handle {
         $self->_report( ( $context->acknowledgement->failure )[2], $context );
         return $self->{loop}->new_future->fail( $context->acknowledgement->failure );
     }
+
+    # Reserve the ID and active slot before invoking handlers that can re-enter dispatch.
     my $result = $self->{loop}->new_future;
-    my $job = { ctx => $context, result => $result };
+    my $job = { context => $context, result => $result };
     my $key = refaddr($job);
     $self->{jobs}{$key} = $job;
     $self->{seen}{ $context->id } =
         { expires => $now + $self->{seen_ttl}, ack => $context->acknowledgement, result => $result };
     ++$self->{counters}{received};
+
+    # Release work capacity on every terminal result; unanswered contexts also close.
     $result->on_ready(
         sub {
             delete $self->{jobs}{$key};
@@ -114,13 +133,23 @@ sub handle {
         }
     );
     $job->{handler} = $self->_invoke_handler($job);
+
+    # Shutdown can run inside the handler before its Future is registered.
+    # Cancel that returned work even though the result has already settled.
+    if ( $result->is_ready ) {
+        $job->{handler}->cancel unless $job->{handler}->is_ready;
+        return $args{acknowledgement_only} ? $context->acknowledgement : $result;
+    }
+
     $self->_watch_job($job);
     return $args{acknowledgement_only} ? $context->acknowledgement : $result;
 }
 
 sub _invoke_handler {
     my ( $self, $job ) = @_;
-    my $context = $job->{ctx};
+    my $context = $job->{context};
+
+    # Resolve the local declaration before calling application code.
     my $handler = eval { $self->{commands}->handler_for($context) };
     if ( !$handler || $@ ) {
         my $message = $@ ? 'Invalid interaction command options' : 'No handler for this interaction';
@@ -128,11 +157,14 @@ sub _invoke_handler {
         return $self->{loop}->new_future->done;
     }
 
+    # Capture synchronous failures; asynchronous work is observed by the job watcher.
     my $work = eval { $handler->($context) };
     if ($@) {
         $self->_record_job_error( $job, 'Interaction handler failed', 'handler' );
         return $self->{loop}->new_future->done;
     }
+
+    # Autocomplete handlers may return choices directly instead of sending a response.
     if ( $context->type == 4 && ref($work) eq 'ARRAY' && !$context->responded ) {
         return $context->autocomplete($work);
     }
@@ -143,16 +175,19 @@ sub _invoke_handler {
 sub _record_job_error {
     my ( $self, $job, $message, $category ) = @_;
     $job->{error} = $self->_error( $message, $category );
-    $self->_report( $job->{error}, $job->{ctx} ) unless $self->{closed};
+    $self->_report( $job->{error}, $job->{context} ) unless $self->{closed};
 }
 
 sub _watch_job {
     my ( $self, $job ) = @_;
-    my $context = $job->{ctx};
+    my $context = $job->{context};
     my $work = $job->{handler};
+
+    # Recheck both completion paths because acknowledgement and handler work can settle in either order.
     my $check = sub { $self->_check_job($job) };
     $work->on_ready(
         sub {
+            # Resolve asynchronously produced suggestions only if the handler has not already replied.
             if ( $context->type == 4 && $work->is_done && !$context->responded ) {
                 my ($choices) = $work->result;
                 if ( ref($choices) eq 'ARRAY' ) {
@@ -172,14 +207,17 @@ sub _check_job {
     my $result = $job->{result};
     return if $result->is_ready;
 
-    my $context = $job->{ctx};
+    my $context = $job->{context};
     my $work = $job->{handler};
     my $acknowledgement = $context->acknowledgement;
+
+    # Record a handler failure once, allowing an error hook to close the dispatcher.
     if ( $work->is_ready && !$work->is_done && !$job->{error} ) {
         $self->_record_job_error( $job, 'Interaction handler failed', 'handler' );
     }
     return if $result->is_ready;
 
+    # Failed acknowledgement ends the job and cancels any work that can no longer reply.
     if ( $acknowledgement->is_ready && !$acknowledgement->is_done ) {
         my $error = $job->{error};
         unless ($error) {
@@ -219,11 +257,13 @@ sub stats {
 
 sub close {
     my ($self) = @_;
+
+    # Stop admission before cancelling a snapshot of jobs that can remove themselves.
     $self->{closed} = 1;
     my @jobs = values %{ $self->{jobs} };
     for my $job (@jobs) {
         $job->{result}->cancel unless $job->{result}->is_ready;
-        $job->{ctx}->close;
+        $job->{context}->close;
     }
     $self->{seen} = {};
     return $self->{loop}->new_future->done;

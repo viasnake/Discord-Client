@@ -12,12 +12,16 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Validate callback limits before constructing owned resources.
     croak 'on_error must be a code reference' if exists( $args{on_error} ) && ref( $args{on_error} ) ne 'CODE';
     croak 'max_callbacks must be a positive integer'
         if exists( $args{max_callbacks} )
         && (  !defined( $args{max_callbacks} )
             || ref( $args{max_callbacks} )
             || $args{max_callbacks} !~ /\A[1-9]\d*\z/ );
+
+    # Load the independently usable components and share one event loop.
     require Discord::Client::REST;
     require Discord::Client::Gateway;
     require Discord::Client::Commands;
@@ -30,8 +34,12 @@ sub new {
         on_error => $args{on_error},
         max_callbacks => $args{max_callbacks} // 1024,
     }, $class;
+
+    # Child callbacks must not keep the client alive through an ownership cycle.
     my $weak = $self;
     weaken($weak);
+
+    # Share REST across commands and interactions; only close a client we create.
     $self->{cache} = _create_cache( $args{cache} );
     $self->{rest} = $args{rest} // Discord::Client::REST->new(
         token => $args{token},
@@ -51,6 +59,8 @@ sub new {
         %{ $args{interaction_options} // {} },
         on_error => sub { $weak->_report( $_[0], $_[1] ) if $weak }
     );
+
+    # Keep connection options separate from interaction admission limits.
     my %gateway_options = (
         %{ $args{gateway_options} // {} },
         token => $args{token},
@@ -60,12 +70,16 @@ sub new {
         on_error => sub { $weak->_report( $_[0] ) if $weak }
     );
     $self->{gateway} = _create_gateway( \%args, \%gateway_options );
+
+    # Apply SDK state before admitting application callbacks to the bounded queue.
     $self->{gateway}->_on_dispatch(
         sub {
             return unless $weak;
             $weak->_receive_gateway_event(@_);
         }
     );
+
+    # Forward application notifications through the client callback lifecycle.
     $self->{gateway}->on(
         '*' => sub {
             my ( $event, $data, $gateway, $packet ) = @_;
@@ -78,6 +92,8 @@ sub new {
 
 sub _create_cache {
     my ($cache) = @_;
+
+    # Reuse a supplied cache or construct an explicitly enabled one.
     return undef unless $cache;
     require Discord::Client::Cache;
 
@@ -90,6 +106,8 @@ sub _create_cache {
 
 sub _create_gateway {
     my ( $args, $options ) = @_;
+
+    # Choose one connection owner without starting network I/O.
     return $args->{gateway} if $args->{gateway};
     if ( exists $args->{shards} ) {
         require Discord::Client::Gateway::Shards;
@@ -100,6 +118,8 @@ sub _create_gateway {
 
 sub _receive_gateway_event {
     my ( $self, $event, $data, $gateway, $packet, $received_at ) = @_;
+
+    # Publish READY state before startup observers or application handlers run.
     $self->{cache}->apply( $event, $data ) if $self->{cache};
     if ( $event eq 'READY' ) {
         $self->{user} = $data->{user};
@@ -114,11 +134,15 @@ sub _receive_gateway_event {
 
 sub _dispatch_interaction {
     my ( $self, $data, $received_at ) = @_;
+
+    # Pass receipt time through so queue delays count toward acknowledgement expiry.
     my %options = ( acknowledgement_only => 1 );
     $options{received_at} = $received_at if defined $received_at;
     my $acknowledgement = $self->{interactions}->handle( $data, %options );
     my $weak = $self;
     weaken($weak);
+
+    # Report admission errors here; the dispatcher reports admitted handler errors.
     $acknowledgement->on_fail(
         sub {
             my ( undef, undef, $error ) = @_;
@@ -132,6 +156,7 @@ sub _dispatch_interaction {
     return $acknowledgement;
 }
 
+# These accessors expose shared components without fetching or copying resources.
 sub loop { $_[0]->{loop} }
 sub rest { $_[0]->{rest} }
 sub gateway { $_[0]->{gateway} }
@@ -148,6 +173,8 @@ sub model {
 
 sub stats {
     my ($self) = @_;
+
+    # Expose counters without including credentials or event payloads.
     return {
         rest => $self->{rest}->stats,
         gateway => $self->{gateway}->stats,
@@ -170,6 +197,8 @@ sub component {
 
 sub on {
     my ( $self, $event, $callback ) = @_;
+
+    # Normalize event names once so registration and delivery use the same keys.
     croak 'Event and callback are required' unless defined($event) && !ref($event) && ref($callback) eq 'CODE';
     push @{ $self->{handlers}{ uc($event) } }, $callback;
     return $self;
@@ -192,29 +221,41 @@ sub on_message {
 sub _emit {
     my ( $self, $event, @data ) = @_;
     return if $self->{closed};
+
+    # Bound pending work before invoking another application callback.
     for my $callback ( @{ $self->{handlers}{ uc($event) } // [] } ) {
         last if $self->{closed};
         if ( keys( %{ $self->{callbacks} } ) >= $self->{max_callbacks} ) {
             $self->_report_error( 'Client event callback capacity exceeded', 'queue_full' );
             last;
         }
-        my $f = eval { $callback->( @data, $self ) };
+
+        # Isolate synchronous exceptions so later listeners can still run.
+        my $future = eval { $callback->( @data, $self ) };
         if ($@) {
             $self->_report_error( 'Client event handler failed', 'handler' );
             next;
         }
         if ( $self->{closed} ) {
-            $f->cancel if blessed($f) && $f->isa('Future') && !$f->is_ready;
+
+            # A callback may return close itself; let that shutdown finish.
+            $future->cancel
+                if blessed($future)
+                && $future->isa('Future')
+                && !$future->is_ready
+                && ( !$self->{close_future} || $future != $self->{close_future} );
             last;
         }
-        if ( blessed($f) && $f->isa('Future') ) {
+
+        # Retain asynchronous work until completion and report only sanitized failures.
+        if ( blessed($future) && $future->isa('Future') ) {
             my $key = ++$self->{callback_id};
-            $self->{callbacks}{$key} = $f;
-            $f->on_ready(
+            $self->{callbacks}{$key} = $future;
+            $future->on_ready(
                 sub {
                     delete $self->{callbacks}{$key};
                     $self->_report_error( 'Client event handler failed', 'handler' )
-                        if !$f->is_done && !$self->{closed};
+                        if !$future->is_done && !$self->{closed};
                 }
             );
         }
@@ -228,43 +269,61 @@ sub _report_error {
 }
 
 sub _report {
-    my ( $self, $error, $ctx ) = @_;
+    my ( $self, $error, $context ) = @_;
     return if $self->{closed};
+
+    # Use the configured hooks, falling back to a sanitized warning.
     my @handlers = ( $self->{on_error} ? $self->{on_error} : (), @{ $self->{handlers}{ERROR} // [] } );
     if ( !@handlers ) {
         warn $error->message . "\n";
         return;
     }
+
+    # An error hook must not propagate an exception into the event loop.
     for my $handler (@handlers) {
-        my $ok = eval { $handler->( $error, $ctx, $self ); 1 };
+        my $ok = eval {
+            $handler->( $error, $context, $self );
+            1;
+        };
         warn "Client error handler failed\n" unless $ok;
     }
 }
 
 sub start {
     my ($self) = @_;
-    my $f = $self->{gateway}->connect->then_done($self);
-    $f->on_cancel( sub { $self->close } );
-    return $f;
+
+    # Tie startup cancellation to the lifetime of the whole client.
+    my $future = $self->{gateway}->connect->then_done($self);
+    $future->on_cancel( sub { $self->close } );
+    return $future;
 }
 sub completion { $_[0]->{gateway}->completion }
 
 sub run {
     my ($self) = @_;
+
+    # Signals are optional on some platforms; remember only installed handlers.
     my @signals;
     for my $signal (qw(INT TERM)) {
         my $id = eval {
-            $self->{loop}->attach_signal( $signal => sub { $self->close } )
+            $self->{loop}->attach_signal( $signal => sub { $self->close } );
         };
         push @signals, [ $signal, $id ] if defined $id;
     }
+
+    # Drive startup and lifetime using the same loop-backed Futures.
     my $ran = eval {
         $self->start->get;
         $self->completion->get;
         1;
     };
     my $run_error = $@;
-    my $closed = eval { $self->close->get; 1 };
+
+    # Always attempt cleanup, preserving the original failure over cleanup errors.
+    my $closed = eval {
+        $self->close->get;
+        1;
+    };
     my $close_error = $@;
     $self->{loop}->detach_signal(@$_) for @signals;
     die $run_error unless $ran;
@@ -275,12 +334,20 @@ sub run {
 sub close {
     my ($self) = @_;
     return $self->{close_future} if $self->{close_future};
+
+    # Stop new callbacks before cancelling work that can invoke completion hooks.
     $self->{closed} = 1;
     $self->{interactions}->close;
     $self->{commands}->close;
+
+    # Detach the registry before cancellation callbacks can re-enter it.
     my @callbacks = values %{ $self->{callbacks} };
     $self->{callbacks} = {};
-    for my $f (@callbacks) { $f->cancel unless $f->is_ready }
+    for my $future (@callbacks) {
+        $future->cancel unless $future->is_ready;
+    }
+
+    # Wait for transport shutdown and release only the REST client we own.
     my @closing = ( $self->{gateway}->close );
     push @closing, $self->{rest}->close if $self->{own_rest};
     $self->{handlers} = {};
@@ -379,7 +446,8 @@ fails on a fatal error.
 
 Returns a Future waiting for shutdown. Repeated calls return the same Future.
 Cancels handlers and owned network work. Closing from a handler stops later
-callbacks and cancels that handler's pending Future.
+callbacks and cancels that handler's pending Future, unless it is the Future
+returned by C<close> itself. Returning C<close> lets graceful shutdown finish.
 
 =head2 command
 

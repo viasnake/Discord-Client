@@ -16,6 +16,8 @@ our $VERSION = '0.001';
 
 sub new {
     my ( $class, %args ) = @_;
+
+    # Validate static session inputs before recording resumable state.
     croak 'token is required' if !defined( $args{token} ) || ref( $args{token} ) || $args{token} eq '';
 
     my $intents = $args{intents} // 0;
@@ -25,8 +27,8 @@ sub new {
     croak 'intents must be a nonnegative integer or arrayref of names'
         if ref($intents) || $intents !~ /\A\d+\z/;
 
-    my $rng = $args{random} // sub { rand() };
-    croak 'random must be a coderef' if ref($rng) ne 'CODE';
+    my $random = $args{random} // sub { rand() };
+    croak 'random must be a coderef' if ref($random) ne 'CODE';
     my $shard = $args{shard};
     croak 'shard must contain a valid shard ID and total'
         if defined($shard)
@@ -37,10 +39,11 @@ sub new {
             || !$shard->[1]
             || $shard->[0] >= $shard->[1] );
 
+    # A new session has neither a sequence nor a resumable connection identity.
     return bless {
         token => $args{token},
         intents => 0 + $intents,
-        random => $rng,
+        random => $random,
         shard => $shard ? [ map { 0 + $_ } @$shard ] : undef,
         state => 'disconnected',
         seq => undef,
@@ -60,6 +63,8 @@ sub heartbeat_pending { $_[0]->{heartbeat_pending} }
 
 sub can_resume {
     my ($self) = @_;
+
+    # All three fields are required to resume the same Discord session.
     return
            defined( $self->{session_id} )
         && defined( $self->{seq} )
@@ -68,6 +73,8 @@ sub can_resume {
 
 sub opened {
     my ($self) = @_;
+
+    # A new socket awaits HELLO while retaining any resumable session identity.
     $self->{state} = 'awaiting_hello';
     $self->{heartbeat_pending} = 0;
     $self->{heartbeat_interval_ms} = undef;
@@ -76,26 +83,14 @@ sub opened {
 
 sub receive {
     my ( $self, $packet ) = @_;
+
+    # Reject malformed envelopes before switching on the protocol opcode.
     croak 'gateway packet must be a hashref' if ref $packet ne 'HASH';
     my $op = $packet->{op};
     croak 'gateway packet opcode missing or invalid'
         if !defined($op) || ref($op) || $op !~ /\A\d+\z/;
 
-    if ( $op == 10 ) {    # HELLO
-        croak 'HELLO received outside handshake' if $self->{state} ne 'awaiting_hello';
-        croak 'HELLO payload must be a hashref' if ref( $packet->{d} ) ne 'HASH';
-        my $interval = $packet->{d}{heartbeat_interval};
-        croak 'invalid heartbeat interval'
-            if !defined($interval) || ref($interval) || $interval !~ /\A\d+\z/ || $interval <= 0;
-        my $first = int( $interval * $self->_random );
-        $self->{heartbeat_interval_ms} = 0 + $interval;
-        $self->{state} = 'authenticating';
-        my $auth = $self->can_resume ? $self->_resume : $self->_identify;
-        return [
-            { action => 'heartbeat_schedule', first_delay_ms => $first, interval_ms => 0 + $interval },
-            { action => 'send', payload => $auth },
-        ];
-    }
+    return $self->_receive_hello( $packet->{d} ) if $op == 10;
 
     if ( $op == 11 ) {    # HEARTBEAT ACK
         $self->{heartbeat_pending} = 0;
@@ -108,33 +103,7 @@ sub receive {
         return [ $self->_heartbeat_action ];
     }
 
-    if ( $op == 0 ) {    # DISPATCH
-        croak 'DISPATCH received outside a session'
-            unless $self->{state} eq 'authenticating' || $self->{state} eq 'ready';
-        croak 'DISPATCH missing event name'
-            if !defined( $packet->{t} ) || ref( $packet->{t} ) || !length( $packet->{t} );
-        croak 'DISPATCH sequence is invalid' unless _uint( $packet->{s} );
-        my $event = $packet->{t};
-        my $data = $packet->{d};
-        if ( $event eq 'READY' ) {
-            croak 'READY requires session_id and resume_gateway_url'
-                if ref($data) ne 'HASH'
-                || !defined( $data->{session_id} )
-                || ref( $data->{session_id} )
-                || !length( $data->{session_id} )
-                || !defined( $data->{resume_gateway_url} )
-                || ref( $data->{resume_gateway_url} )
-                || $data->{resume_gateway_url} !~ m{\Awss://[^\s]+\z};
-            $self->{session_id} = $data->{session_id};
-            $self->{resume_gateway_url} = $data->{resume_gateway_url};
-            $self->{state} = 'ready';
-        }
-        elsif ( $event eq 'RESUMED' ) {
-            $self->{state} = 'ready';
-        }
-        $self->{seq} = $packet->{s};
-        return [ { action => 'event', name => $event, data => $data } ];
-    }
+    return $self->_receive_dispatch($packet) if $op == 0;
 
     if ( $op == 7 ) {    # RECONNECT
         $self->{state} = 'disconnected';
@@ -159,12 +128,68 @@ sub receive {
     return [ { action => 'opcode', op => 0 + $op, data => $packet->{d} } ];
 }
 
+sub _receive_hello {
+    my ( $self, $data ) = @_;
+
+    # Validate HELLO before committing the heartbeat schedule and authentication state.
+    croak 'HELLO received outside handshake' if $self->{state} ne 'awaiting_hello';
+    croak 'HELLO payload must be a hashref' if ref($data) ne 'HASH';
+    my $interval = $data->{heartbeat_interval};
+    croak 'invalid heartbeat interval'
+        if !defined($interval) || ref($interval) || $interval !~ /\A\d+\z/ || $interval <= 0;
+
+    # Jitter the first heartbeat, then choose Resume or Identify from saved state.
+    my $first = int( $interval * $self->_random );
+    $self->{heartbeat_interval_ms} = 0 + $interval;
+    $self->{state} = 'authenticating';
+    my $auth = $self->can_resume ? $self->_resume : $self->_identify;
+    return [
+        { action => 'heartbeat_schedule', first_delay_ms => $first, interval_ms => 0 + $interval },
+        { action => 'send', payload => $auth },
+    ];
+}
+
+sub _receive_dispatch {
+    my ( $self, $packet ) = @_;
+
+    # Validate dispatch data before updating the sequence used by heartbeats and Resume.
+    croak 'DISPATCH received outside a session'
+        unless $self->{state} eq 'authenticating' || $self->{state} eq 'ready';
+    croak 'DISPATCH missing event name'
+        if !defined( $packet->{t} ) || ref( $packet->{t} ) || !length( $packet->{t} );
+    croak 'DISPATCH sequence is invalid' unless _uint( $packet->{s} );
+    my $event = $packet->{t};
+    my $data = $packet->{d};
+    if ( $event eq 'READY' ) {
+        croak 'READY requires session_id and resume_gateway_url'
+            if ref($data) ne 'HASH'
+            || !defined( $data->{session_id} )
+            || ref( $data->{session_id} )
+            || !length( $data->{session_id} )
+            || !defined( $data->{resume_gateway_url} )
+            || ref( $data->{resume_gateway_url} )
+            || $data->{resume_gateway_url} !~ m{\Awss://[^\s]+\z};
+        $self->{session_id} = $data->{session_id};
+        $self->{resume_gateway_url} = $data->{resume_gateway_url};
+        $self->{state} = 'ready';
+    }
+    elsif ( $event eq 'RESUMED' ) {
+        $self->{state} = 'ready';
+    }
+
+    # Publish the new sequence only after validating session-establishing events.
+    $self->{seq} = $packet->{s};
+    return [ { action => 'event', name => $event, data => $data } ];
+}
+
 sub heartbeat_due {
     my ($self) = @_;
     return []
         if !defined( $self->{heartbeat_interval_ms} )
         || $self->{state} eq 'disconnected'
         || $self->{state} eq 'stopped';
+
+    # Do not send another scheduled heartbeat to a connection that failed to acknowledge.
     if ( $self->{heartbeat_pending} ) {
         $self->{state} = 'disconnected';
         $self->{heartbeat_pending} = 0;
@@ -180,11 +205,14 @@ sub closed {
     $self->{heartbeat_interval_ms} = undef;
     return [] if $self->{state} eq 'stopped';
 
+    # Authentication and configuration rejections cannot be repaired by reconnecting.
     if ( $code =~ /\A(?:4004|4010|4011|4012|4013|4014)\z/ ) {
         $self->_forget_session;
         $self->{state} = 'stopped';
         return [ { action => 'fatal', close_code => 0 + $code } ];
     }
+
+    # Only normal closure and invalid session/sequence codes discard resumable state.
     $self->_forget_session if $code =~ /\A(?:1000|1001|4007|4009)\z/;
     $self->{state} = 'disconnected';
     return [ $self->_reconnect_action(0) ];
@@ -192,6 +220,8 @@ sub closed {
 
 sub stop {
     my ($self) = @_;
+
+    # An explicit stop invalidates both heartbeat state and resumable identity.
     $self->_forget_session;
     $self->{heartbeat_interval_ms} = undef;
     $self->{heartbeat_pending} = 0;
@@ -201,6 +231,8 @@ sub stop {
 
 sub _identify {
     my ($self) = @_;
+
+    # Build only protocol data; the transport decides when an Identify may be sent.
     return {
         op => 2,
         d => {
@@ -218,6 +250,8 @@ sub _identify {
 
 sub _resume {
     my ($self) = @_;
+
+    # Resume the saved session at its last validated dispatch sequence.
     return {
         op => 6,
         d => {
@@ -236,6 +270,8 @@ sub _heartbeat_action {
 
 sub _forget_session {
     my ($self) = @_;
+
+    # Discard the whole resume identity so a later socket must Identify again.
     $self->{session_id} = undef;
     $self->{resume_gateway_url} = undef;
     $self->{seq} = undef;
@@ -252,6 +288,8 @@ sub _reconnect_action {
 
 sub _random {
     my ($self) = @_;
+
+    # Injected randomness must obey the same bounds as rand before it affects timing.
     my $value = $self->{random}->();
     croak 'random generator must return a number in [0, 1)'
         if !defined($value)
