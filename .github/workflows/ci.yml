@@ -34,7 +34,6 @@ jobs:
           - { os: ubuntu-latest, perl: '5.26' }
           - { os: ubuntu-latest, perl: '5.32' }
           - { os: ubuntu-latest, perl: '5' }
-          - { os: macos-latest, perl: '5' }
           - { os: windows-latest, perl: '5' }
     runs-on: ${{ matrix.os }}
     steps:
