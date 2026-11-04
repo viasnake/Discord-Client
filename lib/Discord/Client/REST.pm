@@ -317,7 +317,10 @@ sub _build_request {
 
 sub _complete_request {
     my ( $self, $future, $source, $method, $secrets, $raw_response ) = @_;
-    return if $future->is_ready;
+
+    # Cancellation callbacks run before readiness; do not re-enter cancellation
+    # when the scheduler reports the cancellation we just propagated inward.
+    return if $future->is_ready || $future->is_cancelled;
     if ( $source->is_cancelled ) {
         $future->cancel;
         return;
