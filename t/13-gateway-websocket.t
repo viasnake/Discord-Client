@@ -3,6 +3,7 @@ use warnings;
 use Test2::V1;
 use lib 't/lib';
 use TestDiscordTLS qw(certificate_directory);
+use TestDiscordREST ();
 use Future;
 use Scalar::Util qw(weaken);
 use IO::Async::Loop;
@@ -19,6 +20,8 @@ my $dir = certificate_directory('127.0.0.1');
 
 # Script a local Gateway that accepts Identify and later Resume on a new connection.
 my $loop = IO::Async::Loop->new;
+my $clock = TestDiscordREST::Clock->new;
+my $heartbeat_received = $loop->new_future;
 my ( @clients, @handshakes, @payloads, @http_streams, @errors );
 my $gateway_url;
 my $server = Net::Async::WebSocket::Server->new(
@@ -67,8 +70,13 @@ my $server = Net::Async::WebSocket::Server->new(
                 }
 
                 # Withhold ACKs only on the first connection to force a real transport reconnect.
-                elsif ( $packet->{op} == 1 && @clients > 1 ) {
-                    $client->send_text_frame('{"op":11}');
+                elsif ( $packet->{op} == 1 ) {
+                    if ( @clients > 1 ) {
+                        $client->send_text_frame('{"op":11}');
+                    }
+                    else {
+                        $heartbeat_received->done unless $heartbeat_received->is_ready;
+                    }
                 }
             },
             on_close_frame => sub { $client->close }
@@ -136,17 +144,33 @@ my $gateway = Discord::Client::Gateway->new(
     backoff_max => 0.1,
     connect_timeout => 2,
     random => sub { 0.25 },
+    clock => sub { $clock->{now} },
+    delay => sub { $clock->delay( $_[0] ) },
     on_error => sub { push @errors, $_[0] }
 );
 
 # Bound the integration wait so handshake or heartbeat regressions cannot hang CI.
 my $resumed = $loop->new_future;
+my $large_received = $loop->new_future;
 my $large;
 $gateway->on( RESUMED => sub { $resumed->done unless $resumed->is_ready } );
-$gateway->on( LARGE_EVENT => sub { $large = length( $_[0]{text} ) } );
+$gateway->on(
+    LARGE_EVENT => sub {
+        $large = length( $_[0]{text} );
+        $large_received->done unless $large_received->is_ready;
+    }
+);
 my $start = $gateway->connect;
-my $wait = Future->wait_any( $resumed, $loop->timeout_future( after => 5 ) );
-$loop->await($wait);
+
+# Receive the large dispatch before starting the missed-ACK scenario. Controlled
+# protocol time cannot disconnect a slow peer halfway through the large frame.
+await_wire($large_received);
+$clock->advance(0.02);
+await_wire($heartbeat_received);
+T2->ok( $heartbeat_received->is_done, 'the server receives the heartbeat whose ACK is withheld' );
+$clock->advance(0.08);
+$clock->advance(0.1);
+await_wire($resumed);
 T2->diag( join( '; ', map { $_->category . ': ' . $_->message } @errors ) ) unless $start->is_done;
 T2->ok( $start->is_done, 'real WSS handshake and Identify reach READY' );
 T2->ok( $resumed->is_done, 'missing ACK reconnects and resumes over real WSS' );
@@ -177,3 +201,12 @@ $_->close for @clients, @http_streams;
 $server->close;
 $listener->close;
 T2->done_testing;
+
+sub await_wire {
+    my ($future) = @_;
+
+    # Keep socket failures bounded independently of the controlled protocol clock.
+    my $watchdog = $loop->timeout_future( after => 5 );
+    $loop->await( Future->wait_any( $future, $watchdog ) );
+    $watchdog->cancel unless $watchdog->is_ready;
+}

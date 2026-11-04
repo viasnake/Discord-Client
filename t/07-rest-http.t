@@ -1,13 +1,28 @@
 use v5.26;
 use warnings;
 use Test2::V1;
+use Future;
 use IO::Async::Loop;
 use IO::Async::Listener;
 use Net::Async::HTTP;
 use Discord::Client::REST;
 
+# Control the adapter's deadline without replacing its HTTP transport or socket I/O.
+{
+
+    package Local::HTTPTestLoop;
+    use parent 'IO::Async::Loop::Select';
+    our $deadline;
+
+    sub timeout_future {
+        return $deadline if $deadline;
+        return shift->SUPER::timeout_future(@_);
+    }
+}
+
 # Serve HTTP only on an ephemeral loopback port; no Discord connection is involved.
-my $loop = IO::Async::Loop->new;
+my $loop = Local::HTTPTestLoop->new;
+my $silent_received = $loop->new_future;
 my ( @requests, @streams );
 my $listener = IO::Async::Listener->new(
     on_stream => sub {
@@ -27,7 +42,10 @@ my $listener = IO::Async::Listener->new(
                 push @requests, $request;
 
                 # Deliberately leave one route unanswered to exercise the real adapter timeout.
-                return 0 if $request =~ m{^GET /api/v10/silent };
+                if ( $request =~ m{^GET /api/v10/silent } ) {
+                    $silent_received->done unless $silent_received->is_ready;
+                    return 0;
+                }
                 my $body = '{"id":"18446744073709551615"}';
                 $stream->write( "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: "
                         . length($body)
@@ -76,7 +94,20 @@ my $injected = Discord::Client::REST->new(
     base_url => $base,
     timeout => 0.05
 );
-my $timeout = $injected->request( 'GET', '/silent' );
+my $deadline = $loop->new_future;
+my $timeout;
+{
+    local $Local::HTTPTestLoop::deadline = $deadline;
+    $timeout = $injected->request( 'GET', '/silent' );
+}
+
+# Expire the adapter timeout only after the server has received the complete request.
+# The real watchdog bounds broken socket I/O without racing the expected request count.
+my $watchdog = $loop->timeout_future( after => 5 );
+$loop->await( Future->wait_any( $silent_received, $watchdog ) );
+$watchdog->cancel unless $watchdog->is_ready;
+T2->ok( $silent_received->is_done, 'silent request reaches the server before timeout' );
+$deadline->fail('Timeout');
 $loop->await($timeout);
 my ( undef, $category ) = $timeout->failure;
 T2->is( $category, 'timeout', 'real HTTP timeout classified' );
