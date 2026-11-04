@@ -85,11 +85,14 @@ my $server = Net::Async::WebSocket::Server->new(
     },
 );
 $loop->add($server);
-$server->listen(
-    addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 },
-    extensions => ['SSL'],
-    SSL_cert_file => "$dir/cert.pem",
-    SSL_key_file => "$dir/key.pem"
+await_wire(
+    $server->listen(
+        addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 },
+        extensions => ['SSL'],
+        SSL_cert_file => "$dir/cert.pem",
+        SSL_key_file => "$dir/key.pem"
+    ),
+    'WSS listener setup'
 )->get;
 $gateway_url = 'wss://127.0.0.1:' . $server->read_handle->sockport;
 
@@ -127,7 +130,8 @@ my $listener = IO::Async::Listener->new(
     }
 );
 $loop->add($listener);
-$listener->listen( addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 } )->get;
+await_wire( $listener->listen( addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 } ),
+    'HTTP discovery listener setup' )->get;
 
 # Use the production adapters against the test servers with explicit CA trust.
 my $rest = Discord::Client::REST->new(
@@ -164,13 +168,13 @@ my $start = $gateway->connect;
 
 # Receive the large dispatch before starting the missed-ACK scenario. Controlled
 # protocol time cannot disconnect a slow peer halfway through the large frame.
-await_wire($large_received);
+await_wire( $large_received, 'large Gateway dispatch' );
 $clock->advance(0.02);
-await_wire($heartbeat_received);
+await_wire( $heartbeat_received, 'heartbeat receipt' );
 T2->ok( $heartbeat_received->is_done, 'the server receives the heartbeat whose ACK is withheld' );
 $clock->advance(0.08);
 $clock->advance(0.1);
-await_wire($resumed);
+await_wire( $resumed, 'Gateway Resume' );
 T2->diag( join( '; ', map { $_->category . ': ' . $_->message } @errors ) ) unless $start->is_done;
 T2->ok( $start->is_done, 'real WSS handshake and Identify reach READY' );
 T2->ok( $resumed->is_done, 'missing ACK reconnects and resumes over real WSS' );
@@ -186,7 +190,7 @@ T2->is( $resume->{d}{session_id}, 'wire-session', 'actual Resume session' );
 T2->is( $resume->{d}{seq}, 43, 'actual Resume dispatch sequence' );
 
 # Close owned resources and verify no notifier or callback cycle keeps the driver alive.
-$gateway->close->get;
+await_wire( $gateway->close, 'Gateway shutdown' )->get;
 T2->is( $gateway->state, 'closed', 'real transport closes cleanly' );
 T2->ok( !grep( $_->isa('Net::Async::WebSocket::Client'), $loop->notifiers ), 'SDK WebSocket notifier removed' );
 my $weak = $gateway;
@@ -196,17 +200,21 @@ undef $gateway;
 T2->ok( !defined($weak), 'closed driver has no retained callback or completed Future cycle' );
 
 # Release the separately owned REST client and all local server connections.
-$rest->close->get;
+await_wire( $rest->close, 'REST shutdown' )->get;
 $_->close for @clients, @http_streams;
 $server->close;
 $listener->close;
 T2->done_testing;
 
 sub await_wire {
-    my ($future) = @_;
+    my ( $future, $description ) = @_;
 
     # Keep socket failures bounded independently of the controlled protocol clock.
     my $watchdog = $loop->timeout_future( after => 5 );
     $loop->await( Future->wait_any( $future, $watchdog ) );
     $watchdog->cancel unless $watchdog->is_ready;
+
+    # wait_any cancels the losing Future, so its readiness alone cannot prove completion.
+    die "Timed out waiting for $description\n" if $watchdog->is_failed;
+    return $future;
 }

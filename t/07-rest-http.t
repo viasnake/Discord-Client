@@ -58,7 +58,8 @@ my $listener = IO::Async::Listener->new(
     }
 );
 $loop->add($listener);
-$listener->listen( addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 } )->get;
+await_http( $listener->listen( addr => { family => 'inet', socktype => 'stream', ip => '127.0.0.1', port => 0 } ),
+    'HTTP listener setup' )->get;
 
 # Point the real HTTP adapter at the local server while retaining the API path prefix.
 my $base = 'http://127.0.0.1:' . $listener->read_handle->sockport . '/api/v10';
@@ -72,16 +73,16 @@ my $rest = Discord::Client::REST->new(
 # Verify request targets, headers and JSON against bytes received by the server.
 T2->ref_is( $rest->loop, $loop, 'caller loop retained' );
 T2->is(
-    $rest->request( 'GET', '/users/@me', query => { limit => 1 } )->get,
+    await_http( $rest->request( 'GET', '/users/@me', query => { limit => 1 } ), 'GET response' )->get,
     { id => '18446744073709551615' },
     'real HTTP transport decodes response'
 );
 T2->like( $requests[0], qr{^GET /api/v10/users/\@me\?limit=1 HTTP/1\.1\r\n}, 'actual request target' );
 T2->like( $requests[0], qr/^Authorization: Bot FAKE_TEST_TOKEN\r$/m, 'actual auth header' );
-$rest->request( 'POST', '/channels/123/messages', json => { content => 'hello' } )->get;
+await_http( $rest->request( 'POST', '/channels/123/messages', json => { content => 'hello' } ), 'POST response' )->get;
 T2->like( $requests[1], qr{^POST /api/v10/channels/123/messages HTTP/1\.1\r\n}, 'actual POST target' );
 T2->like( $requests[1], qr/\r\n\r\n\{"content":"hello"\}\z/, 'actual POST body' );
-$rest->close->get;
+await_http( $rest->close, 'owned REST shutdown' )->get;
 T2->ok( !grep( $_->isa('Net::Async::HTTP'), $loop->notifiers ), 'owned HTTP notifier removed on close' );
 
 # An injected transport remains caller-owned even after timeout and SDK shutdown.
@@ -102,17 +103,14 @@ my $timeout;
 }
 
 # Expire the adapter timeout only after the server has received the complete request.
-# The real watchdog bounds broken socket I/O without racing the expected request count.
-my $watchdog = $loop->timeout_future( after => 5 );
-$loop->await( Future->wait_any( $silent_received, $watchdog ) );
-$watchdog->cancel unless $watchdog->is_ready;
+await_http( $silent_received, 'silent request receipt' );
 T2->ok( $silent_received->is_done, 'silent request reaches the server before timeout' );
 $deadline->fail('Timeout');
-$loop->await($timeout);
+await_http( $timeout, 'HTTP timeout propagation' );
 my ( undef, $category ) = $timeout->failure;
 T2->is( $category, 'timeout', 'real HTTP timeout classified' );
 T2->is( scalar(@requests), 3, 'timeout not retried' );
-$injected->close->get;
+await_http( $injected->close, 'injected REST shutdown' )->get;
 T2->ref_is( $http->loop, $loop, 'injected HTTP remains caller-owned' );
 $loop->remove($http);
 
@@ -123,3 +121,16 @@ for my $stream (@streams) {
 }
 $listener->close;
 T2->done_testing;
+
+sub await_http {
+    my ( $future, $description ) = @_;
+
+    # Bound broken I/O and shutdown independently of the controlled adapter deadline.
+    my $watchdog = $loop->timeout_future( after => 5 );
+    $loop->await( Future->wait_any( $future, $watchdog ) );
+    $watchdog->cancel unless $watchdog->is_ready;
+
+    # wait_any cancels the losing Future, so its readiness alone cannot prove completion.
+    die "Timed out waiting for $description\n" if $watchdog->is_failed;
+    return $future;
+}
