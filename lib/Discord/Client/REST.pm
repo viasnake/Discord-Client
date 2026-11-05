@@ -17,7 +17,7 @@ use Discord::Client ();
 use Discord::Client::REST::Error;
 use Discord::Client::REST::RateLimiter;
 
-our $VERSION = '0.001';
+our $VERSION = '0.001_01';
 
 sub new {
     my ( $class, %args ) = @_;
