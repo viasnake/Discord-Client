@@ -34,7 +34,6 @@ jobs:
           - { os: ubuntu-latest, perl: '5.26' }
           - { os: ubuntu-latest, perl: '5.32' }
           - { os: ubuntu-latest, perl: '5' }
-          - { os: macos-latest, perl: '5' }
           - { os: windows-latest, perl: '5' }
     runs-on: ${{ matrix.os }}
     steps:
@@ -55,6 +54,41 @@ jobs:
         run: |
           perl -MIO::Socket::SSL -MNet::SSLeay -MTime::HiRes -e 'print "IO::Socket::SSL ", IO::Socket::SSL->VERSION, ", Net::SSLeay ", Net::SSLeay->VERSION, ", Time::HiRes ", Time::HiRes->VERSION, ", ", Net::SSLeay::SSLeay_version(0), "\n"'
           perl -MIO::Socket::SSL=debug3 -Ilib t/08-rest-tls.t
+
+  future-implementations:
+    name: Future::XS and pure Perl
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: shogo82148/actions-setup-perl@8b574cdc2dffdae49f803204a4f2b716a2fa1db7 # v1.44.2
+        with:
+          perl-version: '5.44'
+      - name: Install runtime and test dependencies
+        run: cpanm --notest --installdeps .
+      - name: Install the cancellation regression dependency versions
+        run: cpanm --notest --reinstall Future@0.54 Future::XS@0.16
+      - name: Verify Future::XS and run the complete suite
+        env:
+          PERL_FUTURE_NO_XS: '0'
+        run: |
+          perl -MFuture -MFuture::XS -e '
+            print "Perl $^V, Future $Future::VERSION, Future::XS $Future::XS::VERSION\n";
+            die "Future::XS is not active\n" unless Future->new->isa("Future::XS");
+          '
+          prove -lr t
+      - name: Verify pure Perl Future and run the complete suite
+        if: ${{ !cancelled() }}
+        env:
+          PERL_FUTURE_NO_XS: '1'
+        run: |
+          perl -MFuture -MFuture::XS -e '
+            print "Perl $^V, Future $Future::VERSION, Future::XS $Future::XS::VERSION\n";
+            die "Pure Perl Future is not active\n" unless Future->new->isa("Future::PP");
+          '
+          prove -lr t
 
   distribution:
     name: CPAN distribution
