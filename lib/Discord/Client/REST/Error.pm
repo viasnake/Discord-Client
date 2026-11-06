@@ -5,7 +5,7 @@ use strict;
 use warnings;
 use parent 'Discord::Client::Error';
 
-our $VERSION = '0.001_01';
+our $VERSION = '0.002';
 
 1;
 
