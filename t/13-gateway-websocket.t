@@ -2,6 +2,7 @@ use v5.26;
 use warnings;
 use Test2::V1;
 use lib 't/lib';
+use TestDiscordLoop qw(await_future);
 use TestDiscordTLS qw(certificate_directory);
 use TestDiscordREST ();
 use Future;
@@ -243,18 +244,20 @@ sub checkpoint {
 sub await_wire {
     my ( $future, $description ) = @_;
 
-    # Keep socket failures bounded independently of the controlled protocol clock.
+    # Keep socket failures bounded independently of protocol time and wall-clock corrections.
     checkpoint("waiting for $description");
-    my $watchdog = $loop->timeout_future( after => 5 );
-    $loop->await( Future->wait_any( $future, $watchdog ) );
-    $watchdog->cancel unless $watchdog->is_ready;
+    my $ok = eval {
+        await_future( $loop, $future, $description );
+        1;
+    };
+    my $failure = $@;
 
-    # wait_any cancels the losing Future, so its readiness alone cannot prove completion.
-    checkpoint( $watchdog->is_failed ? "timeout waiting for $description" : "finished waiting for $description" );
-    if ( $watchdog->is_failed && $gateway ) {
+    # Retain connection state when an integration wait fails.
+    checkpoint( $ok ? "finished waiting for $description" : "failed waiting for $description" );
+    if ( !$ok && $gateway ) {
         T2->diag( 'Gateway state: ' . $gateway->state . '; accepted WSS connections: ' . scalar(@clients) );
         T2->diag( join( '; ', map { $_->category . ': ' . $_->message } @errors ) ) if @errors;
     }
-    die "Timed out waiting for $description\n" if $watchdog->is_failed;
+    die $failure unless $ok;
     return $future;
 }

@@ -92,6 +92,9 @@ Gateway TLS, Identify, READY and large-frame timings, run
 The diagnostic reports cumulative wall, user and system CPU time from the start
 of certificate generation; CPU times have the platform's `times` resolution.
 It retains the same payloads, assertions and five-second I/O watchdogs.
+The integration watchdogs measure monotonic time so system clock corrections
+cannot expire relative waits early. `PERL_TEST_TIME_OUT_FACTOR` does not scale
+these five-second budgets.
 
 ## Documentation
 
