@@ -78,7 +78,7 @@ a new Guild snapshot. Query pairs are optional; the existing snapshot does not c
 =head2 channels
 
 Returns a Future containing an arrayref of L<Discord::Client::Model::Channel>
-snapshots.
+snapshots for channels the bot can view. See L<Discord::Client::REST/get_guild_channels>.
 
 =head2 fetch_member
 
