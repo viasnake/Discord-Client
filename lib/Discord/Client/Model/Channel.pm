@@ -5,7 +5,7 @@ use strict;
 use warnings;
 use parent 'Discord::Client::Model';
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 use constant CHANNEL_OBFUSCATED => 1 << 17;
 
 sub name { $_[0]->get('name') }

@@ -14,7 +14,7 @@ use Discord::Client::Commands;
 use Discord::Client::Interactions;
 use Discord::Client::REST;
 
-our $VERSION = '0.002';
+our $VERSION = '0.003';
 
 sub new {
     my ( $class, %args ) = @_;
